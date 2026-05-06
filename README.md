@@ -1,6 +1,6 @@
 # nostr-classify
 
-Classifies Nostr profiles based on their on-chain activity using LLMs.
+Classifies Nostr profiles based on their activity using LLMs.
 
 Subscribes to Nostr relays, collects user events, and generates classification labels and bios using an OpenAI-compatible LLM API. Results are stored in SQLite and exposed via a web dashboard and REST API.
 
