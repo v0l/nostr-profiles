@@ -71,7 +71,7 @@ pub struct Classification {
     pub confidence: f64,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Database {
     pub pool: SqlitePool,
 }
@@ -559,6 +559,17 @@ impl Database {
         }).collect();
 
         Ok(results)
+    }
+
+    pub async fn get_metadata_event(&self, pubkey: &str) -> Result<Option<Event>> {
+        let row = sqlx::query_as::<_, Event>(
+            r#"SELECT id, pubkey, kind, created_at, raw_json FROM events WHERE pubkey = ? AND kind = 0 ORDER BY created_at DESC LIMIT 1"#,
+        )
+        .bind(pubkey)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row)
     }
 
     pub async fn search_classifications(&self, query: &str, limit: i64) -> Result<Vec<crate::http_server::RecentClassification>> {

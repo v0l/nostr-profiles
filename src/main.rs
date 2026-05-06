@@ -7,6 +7,7 @@ mod job_queue;
 mod llm_client;
 mod nostr_client;
 mod nostr_collector;
+mod search_relay;
 
 use crate::config::Config;
 use crate::db::Database;
@@ -52,10 +53,13 @@ async fn main() -> Result<()> {
     let job_queue = Arc::new(JobQueue::new(config.processing.max_workers, config.processing.cache_days));
     tracing::info!("Job queue initialized with {} workers", config.processing.max_workers);
 
-    // Start HTTP server for dashboard
+    // Build the search relay backed by our FTS index
+    let relay = search_relay::SearchDatabase::build_relay(db.clone());
+
+    // Start HTTP server with the search relay on the same port
     let db_clone = Arc::clone(&db);
     let server_handle = tokio::spawn(async move {
-        http_server::serve(db_clone, 3000).await;
+        http_server::serve(db_clone, relay, 3000).await;
     });
 
     let job_queue_clone = Arc::clone(&job_queue);
