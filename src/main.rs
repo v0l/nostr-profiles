@@ -47,8 +47,19 @@ async fn main() -> Result<()> {
     let image_cache = ImageCache::new(&config.image_cache.dir)?;
     tracing::info!("Image cache initialized at {}", config.image_cache.dir);
 
-    let llm = LLMClient::new(&config.llm, nostr.clone());
-    tracing::info!("LLM client initialized with model {}", config.llm.model);
+    let llm = LLMClient::new(
+        &config.llm,
+        nostr.clone(),
+        image_cache.clone(),
+        db.clone(),
+        crate::config::load_label_taxonomy(config.labels.taxonomy_file.as_deref()),
+        config.labels.min_score,
+    );
+    tracing::info!("LLM client initialized with model {} and {} labels (min_score={})",
+        config.llm.model,
+        crate::config::load_label_taxonomy(config.labels.taxonomy_file.as_deref()).len(),
+        config.labels.min_score
+    );
 
     let job_queue = Arc::new(JobQueue::new(config.processing.max_workers, config.processing.cache_days));
     tracing::info!("Job queue initialized with {} workers", config.processing.max_workers);

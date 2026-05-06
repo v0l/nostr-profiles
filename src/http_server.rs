@@ -35,6 +35,7 @@ struct ProfileResponse {
 #[derive(Serialize)]
 struct ClassificationResponse {
     labels: Vec<String>,
+    scores: std::collections::HashMap<String, f64>,
     bio: String,
     confidence: f64,
 }
@@ -45,6 +46,7 @@ pub struct RecentClassification {
     pub name: Option<String>,
     pub picture: Option<String>,
     pub labels: Vec<String>,
+    pub scores: std::collections::HashMap<String, f64>,
     pub bio: String,
     pub confidence: f64,
     pub analyzed_at: Option<String>,
@@ -138,6 +140,7 @@ async fn get_profile(
         if let Ok(classification) = db.get_classification(&pubkey).await {
             response.classification = Some(ClassificationResponse {
                 labels: classification.labels,
+                scores: classification.scores,
                 bio: classification.bio,
                 confidence: classification.confidence,
             });

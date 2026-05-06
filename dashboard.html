@@ -149,11 +149,31 @@
             margin-bottom: 12px;
         }
         .label {
-            background: #3a3a3a;
-            color: #64b5f6;
+            position: relative;
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
             padding: 4px 10px;
             border-radius: 12px;
             font-size: 12px;
+            color: #e0e0e0;
+            overflow: hidden;
+        }
+        .label-bg {
+            position: absolute;
+            inset: 0;
+            border-radius: 12px;
+            opacity: 0.35;
+        }
+        .label-text {
+            position: relative;
+            z-index: 1;
+        }
+        .label-score {
+            position: relative;
+            z-index: 1;
+            font-size: 10px;
+            opacity: 0.6;
         }
         .bio {
             color: #bbb;
@@ -245,6 +265,25 @@
             return Math.floor(hours / 24) + 'd ago';
         }
 
+        // Map label score to a color — higher scores are more vibrant
+        function scoreColor(score) {
+            if (score >= 0.8) return '#66bb6a'; // green
+            if (score >= 0.6) return '#64b5f6'; // blue
+            if (score >= 0.4) return '#ffa726'; // orange
+            return '#ef5350'; // red-ish
+        }
+
+        function LabelPill({ label, score }) {
+            const color = scoreColor(score);
+            return html`
+                <span class="label">
+                    <span class="label-bg" style=${{ background: color }} />
+                    <span class="label-text">${label}</span>
+                    <span class="label-score">${(score * 100).toFixed(0)}%</span>
+                </span>
+            `;
+        }
+
         function ProfileCard({ profile, onSearch }) {
             if (!profile) return null;
             const { name, picture, nip05, pubkey, about, event_count, is_classified, classification } = profile;
@@ -268,7 +307,10 @@
                         <h3 style=${{ color: '#fff', fontSize: '14px', marginBottom: '10px', textTransform: 'uppercase', letterSpacing: '0.5px' }}>Classification</h3>
                         ${is_classified && classification ? html`
                             <div class="labels">
-                                ${classification.labels.map(l => html`<span class="label" key=${l}>${l}</span>`)}
+                                ${classification.labels.map(l => {
+                                    const score = classification.scores?.[l] ?? 0.5;
+                                    return html`<${LabelPill} key=${l} label=${l} score=${score} />`;
+                                })}
                             </div>
                             <p class="bio">${classification.bio}</p>
                             <div class="confidence">
@@ -297,7 +339,10 @@
                         <span class="recent-time">${timeAgo(item.analyzed_at)}</span>
                     </div>
                     <div class="labels">
-                        ${item.labels.slice(0, 5).map(l => html`<span class="label" key=${l}>${l}</span>`)}
+                        ${item.labels.slice(0, 5).map(l => {
+                            const score = item.scores?.[l] ?? 0.5;
+                            return html`<${LabelPill} key=${l} label=${l} score=${score} />`;
+                        })}
                     </div>
                 </div>
             `;

@@ -67,6 +67,7 @@ pub struct Event {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Classification {
     pub labels: Vec<String>,
+    pub scores: std::collections::HashMap<String, f64>,
     pub bio: String,
     pub confidence: f64,
 }
@@ -150,6 +151,7 @@ impl Database {
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 pubkey TEXT NOT NULL UNIQUE,
                 labels TEXT NOT NULL,
+                scores TEXT NOT NULL DEFAULT '{}',
                 bio TEXT NOT NULL,
                 confidence REAL,
                 analyzed_event_count INTEGER,
@@ -168,6 +170,7 @@ impl Database {
                 about,
                 nip05,
                 labels,
+                scores,
                 bio,
                 pubkey UNINDEXED
             )
@@ -177,10 +180,11 @@ impl Database {
         .await?;
 
         // Migrate: recreate FTS table if it uses the old schema
-        // Old schemas: (1) had 'pubkey' as indexed column, (2) used contentless fts5 (content='')
+        // Old schemas: (1) had 'pubkey' as indexed column, (2) used contentless fts5 (content=''),
+        // (3) missing 'scores' column
         // FTS5 tables can't be ALTERed, so drop and rebuild
         let needs_migration: bool = {
-            // Check for old 'pubkey' indexed column or contentless table
+            // Check for old 'pubkey' indexed column
             let has_indexed_pubkey: bool = sqlx::query_scalar::<_, i64>(
                 r#"SELECT COUNT(*) FROM pragma_table_info('classifications_fts') WHERE name = 'pubkey'"#,
             )
@@ -188,11 +192,15 @@ impl Database {
             .await?
             > 0;
 
-            // Contentless FTS5 tables can't be DELETEd from (SQLite < 3.49).
-            // Detect by checking if the table has no content table (contentless).
-            // A simple heuristic: try to query the table — if it has columns but
-            // no data after classifications exist, or if we had the old pubkey column.
-            has_indexed_pubkey
+            // Check for missing 'scores' column
+            let has_scores: bool = sqlx::query_scalar::<_, i64>(
+                r#"SELECT COUNT(*) FROM pragma_table_info('classifications_fts') WHERE name = 'scores'"#,
+            )
+            .fetch_one(pool)
+            .await?
+            > 0;
+
+            has_indexed_pubkey || !has_scores
         };
 
         if needs_migration {
@@ -206,6 +214,7 @@ impl Database {
                     about,
                     nip05,
                     labels,
+                    scores,
                     bio,
                     pubkey UNINDEXED
                 )
@@ -217,9 +226,10 @@ impl Database {
             // Rebuild FTS index from existing classified profiles
             sqlx::query(
                 r#"
-                INSERT INTO classifications_fts (rowid, name, about, nip05, labels, bio, pubkey)
+                INSERT INTO classifications_fts (rowid, name, about, nip05, labels, scores, bio, pubkey)
                 SELECT c.id, p.name, p.about, p.nip05,
                        REPLACE(REPLACE(SUBSTR(c.labels, 2, LENGTH(c.labels) - 2), '"', ''), ',', ' '),
+                       c.scores,
                        c.bio, c.pubkey
                 FROM classifications c
                 JOIN profiles p ON c.pubkey = p.pubkey
@@ -244,6 +254,13 @@ impl Database {
         // Migrate: add follower_count column if missing
         let _ = sqlx::query(
             r#"ALTER TABLE profiles ADD COLUMN follower_count INTEGER"#,
+        )
+        .execute(pool)
+        .await;
+
+        // Migrate: add scores column if missing
+        let _ = sqlx::query(
+            r#"ALTER TABLE classifications ADD COLUMN scores TEXT NOT NULL DEFAULT '{}'"#,
         )
         .execute(pool)
         .await;
@@ -442,13 +459,15 @@ impl Database {
         event_count: usize,
     ) -> Result<()> {
         let labels = serde_json::to_string(&classification.labels)?;
+        let scores = serde_json::to_string(&classification.scores)?;
 
         sqlx::query(
             r#"
-            INSERT INTO classifications (pubkey, labels, bio, confidence, analyzed_event_count)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO classifications (pubkey, labels, scores, bio, confidence, analyzed_event_count)
+            VALUES (?, ?, ?, ?, ?, ?)
             ON CONFLICT(pubkey) DO UPDATE SET
                 labels = excluded.labels,
+                scores = excluded.scores,
                 bio = excluded.bio,
                 confidence = excluded.confidence,
                 analyzed_event_count = excluded.analyzed_event_count,
@@ -457,6 +476,7 @@ impl Database {
         )
         .bind(pubkey)
         .bind(&labels)
+        .bind(&scores)
         .bind(&classification.bio)
         .bind(classification.confidence)
         .bind(event_count as i64)
@@ -483,15 +503,20 @@ impl Database {
 
         // Join labels into plain text for FTS indexing
         let labels_text = classification.labels.join(" ");
+        // Build scores text for FTS: repeat each label proportional to its score
+        // e.g. bitcoin:0.9 → "bitcoin bitcoin", rust:0.4 → "rust"
+        // This gives higher-scoring labels more weight in BM25 ranking
+        let scores_text = scores_to_fts_text(&classification.scores);
         sqlx::query(
-            r#"INSERT INTO classifications_fts (rowid, name, about, nip05, labels, bio, pubkey)
-               VALUES ((SELECT id FROM classifications WHERE pubkey = ?), ?, ?, ?, ?, ?, ?)"#,
+            r#"INSERT INTO classifications_fts (rowid, name, about, nip05, labels, scores, bio, pubkey)
+               VALUES ((SELECT id FROM classifications WHERE pubkey = ?), ?, ?, ?, ?, ?, ?, ?)"#,
         )
         .bind(pubkey)
         .bind(&profile_fields.0)
         .bind(&profile_fields.1)
         .bind(&profile_fields.2)
         .bind(&labels_text)
+        .bind(&scores_text)
         .bind(&classification.bio)
         .bind(pubkey)
         .execute(&self.pool)
@@ -518,8 +543,8 @@ impl Database {
     }
 
     pub async fn get_classification(&self, pubkey: &str) -> Result<Classification> {
-        let (labels, bio, confidence) = sqlx::query_as::<_, (String, String, f64)>(
-            r#"SELECT labels, bio, confidence FROM classifications WHERE pubkey = ?"#,
+        let (labels, scores, bio, confidence) = sqlx::query_as::<_, (String, String, String, f64)>(
+            r#"SELECT labels, scores, bio, confidence FROM classifications WHERE pubkey = ?"#,
         )
         .bind(pubkey)
         .fetch_one(&self.pool)
@@ -527,28 +552,35 @@ impl Database {
 
         let labels: Vec<String> = serde_json::from_str(&labels)
             .map_err(|e| anyhow::anyhow!("Failed to parse labels: {}", e))?;
+        let scores: std::collections::HashMap<String, f64> = serde_json::from_str(&scores)
+            .map_err(|e| anyhow::anyhow!("Failed to parse scores: {}", e))?;
 
         Ok(Classification {
             labels,
+            scores,
             bio,
             confidence,
         })
     }
 
     pub async fn get_classification_if_exists(&self, pubkey: &str) -> Result<Option<Classification>> {
-        let result = sqlx::query_as::<_, (String, String, f64)>(
-            r#"SELECT labels, bio, confidence FROM classifications WHERE pubkey = ?"#,
+        let result = sqlx::query_as::<_, (String, String, String, f64)>(
+            r#"SELECT labels, scores, bio, confidence FROM classifications WHERE pubkey = ?"#,
         )
         .bind(pubkey)
         .fetch_optional(&self.pool)
         .await?;
 
         match result {
-            Some((labels, bio, confidence)) => {
+            Some((labels, scores, bio, confidence)) => {
                 let labels: Vec<String> = serde_json::from_str(&labels)
                     .map_err(|e| anyhow::anyhow!("Failed to parse labels: {}", e))?;
+                let scores: std::collections::HashMap<String, f64> = serde_json::from_str(&scores)
+                    .map_err(|e| anyhow::anyhow!("Failed to parse scores: {}", e))?;
+
                 Ok(Some(Classification {
                     labels,
+                    scores,
                     bio,
                     confidence,
                 }))
@@ -605,9 +637,9 @@ impl Database {
     }
 
     pub async fn get_recent_classifications(&self, limit: i64) -> Result<Vec<crate::http_server::RecentClassification>> {
-        let rows = sqlx::query_as::<_, (String, Option<String>, Option<String>, String, String, f64, Option<chrono::DateTime<chrono::Utc>>)>(
+        let rows = sqlx::query_as::<_, (String, Option<String>, Option<String>, String, String, String, f64, Option<chrono::DateTime<chrono::Utc>>)>(
             r#"
-            SELECT p.pubkey, p.name, p.picture, c.labels, c.bio, c.confidence, c.analyzed_at
+            SELECT p.pubkey, p.name, p.picture, c.labels, c.scores, c.bio, c.confidence, c.analyzed_at
             FROM classifications c
             JOIN profiles p ON c.pubkey = p.pubkey
             ORDER BY c.analyzed_at DESC
@@ -618,13 +650,15 @@ impl Database {
         .fetch_all(&self.pool)
         .await?;
 
-        let results = rows.into_iter().map(|(pubkey, name, picture, labels, bio, confidence, analyzed_at)| {
+        let results = rows.into_iter().map(|(pubkey, name, picture, labels, scores, bio, confidence, analyzed_at)| {
             let parsed_labels: Vec<String> = serde_json::from_str(&labels).unwrap_or_default();
+            let parsed_scores: std::collections::HashMap<String, f64> = serde_json::from_str(&scores).unwrap_or_default();
             crate::http_server::RecentClassification {
                 pubkey,
                 name,
                 picture,
                 labels: parsed_labels,
+                scores: parsed_scores,
                 bio,
                 confidence,
                 analyzed_at: analyzed_at.map(|t| t.to_rfc3339()),
@@ -669,9 +703,10 @@ impl Database {
 
         sqlx::query(
             r#"
-            INSERT INTO classifications_fts (rowid, name, about, nip05, labels, bio, pubkey)
+            INSERT INTO classifications_fts (rowid, name, about, nip05, labels, scores, bio, pubkey)
             SELECT c.id, p.name, p.about, p.nip05,
                    REPLACE(REPLACE(SUBSTR(c.labels, 2, LENGTH(c.labels) - 2), '"', ''), ',', ' '),
+                   c.scores,
                    c.bio, c.pubkey
             FROM classifications c
             JOIN profiles p ON c.pubkey = p.pubkey
@@ -689,9 +724,9 @@ impl Database {
         // Add prefix matching to each term so "bitc" matches "bitcoin"
         let fts_query = Self::prepare_fts_query(query);
 
-        let rows = sqlx::query_as::<_, (String, Option<String>, Option<String>, String, String, f64, Option<chrono::DateTime<chrono::Utc>>)>(
+        let rows = sqlx::query_as::<_, (String, Option<String>, Option<String>, String, String, String, f64, Option<chrono::DateTime<chrono::Utc>>)>(
             r#"
-            SELECT p.pubkey, p.name, p.picture, c.labels, c.bio, c.confidence, c.analyzed_at
+            SELECT p.pubkey, p.name, p.picture, c.labels, c.scores, c.bio, c.confidence, c.analyzed_at
             FROM classifications c
             JOIN profiles p ON c.pubkey = p.pubkey
             JOIN classifications_fts fts ON fts.rowid = c.id
@@ -705,13 +740,15 @@ impl Database {
         .fetch_all(&self.pool)
         .await?;
 
-        let results = rows.into_iter().map(|(pubkey, name, picture, labels, bio, confidence, analyzed_at)| {
+        let results = rows.into_iter().map(|(pubkey, name, picture, labels, scores, bio, confidence, analyzed_at)| {
             let parsed_labels: Vec<String> = serde_json::from_str(&labels).unwrap_or_default();
+            let parsed_scores: std::collections::HashMap<String, f64> = serde_json::from_str(&scores).unwrap_or_default();
             crate::http_server::RecentClassification {
                 pubkey,
                 name,
                 picture,
                 labels: parsed_labels,
+                scores: parsed_scores,
                 bio,
                 confidence,
                 analyzed_at: analyzed_at.map(|t| t.to_rfc3339()),
@@ -744,4 +781,18 @@ impl Database {
             .collect::<Vec<_>>()
             .join(" ")
     }
+}
+
+/// Convert scores map to FTS text where each label is repeated proportional to its score.
+/// Score 0.0–0.33 → 1 occurrence, 0.34–0.66 → 2, 0.67–1.0 → 3.
+/// This gives higher-scoring labels more weight in BM25 ranking.
+fn scores_to_fts_text(scores: &std::collections::HashMap<String, f64>) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for (label, score) in scores {
+        let repeats = (*score * 3.0).round() as usize;
+        for _ in 0..repeats.max(1) {
+            parts.push(label.clone());
+        }
+    }
+    parts.join(" ")
 }

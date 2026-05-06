@@ -15,7 +15,7 @@ futures = "0.3.32"
 hex = "0.4"
 hyper = "1"
 hyper-util = "0.1"
-image = "0.25"
+image = { version = "0.25", features = ["jpeg", "png", "gif", "webp"] }
 nostr-database = "0.44.0"
 nostr-relay-builder = "0.44.0"
 nostr-sdk = "0.44.1"

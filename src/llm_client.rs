@@ -1,4 +1,6 @@
 use crate::config::LlmConfig;
+use crate::db::Database;
+use crate::image_cache::ImageCache;
 use crate::nostr_client::NostrClient;
 use anyhow::{bail, Result};
 use async_openai::{
@@ -20,11 +22,13 @@ use async_openai::types::chat::{
     ChatCompletionRequestAssistantMessage,
     ChatCompletionMessageToolCalls,
 };
+use std::sync::Arc;
 use tracing::info;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Classification {
     pub labels: Vec<String>,
+    pub scores: std::collections::HashMap<String, f64>,
     pub bio: String,
     pub confidence: f64,
 }
@@ -34,10 +38,14 @@ pub struct LLMClient {
     client: Client<OpenAIConfig>,
     model: String,
     nostr: NostrClient,
+    image_cache: ImageCache,
+    db: Arc<Database>,
+    label_taxonomy: Vec<String>,
+    label_min_score: f64,
 }
 
 impl LLMClient {
-    pub fn new(config: &LlmConfig, nostr: NostrClient) -> Self {
+    pub fn new(config: &LlmConfig, nostr: NostrClient, image_cache: ImageCache, db: Arc<Database>, label_taxonomy: Vec<String>, label_min_score: f64) -> Self {
         let openai_config = OpenAIConfig::new()
             .with_api_base(&config.api_base_url)
             .with_api_key(&config.api_key);
@@ -47,36 +55,29 @@ impl LLMClient {
             client,
             model: config.model.clone(),
             nostr,
+            image_cache,
+            db,
+            label_taxonomy,
+            label_min_score,
         }
     }
 
-    pub async fn classify_with_images(
+    pub async fn classify(
         &self,
         context: &str,
-        image_paths: &[String],
     ) -> Result<Classification> {
-        let mut messages: Vec<ChatCompletionRequestMessage> = vec![
+        let prompt = self.build_classification_prompt();
+
+        let messages: Vec<ChatCompletionRequestMessage> = vec![
             ChatCompletionRequestMessage::User(
                 ChatCompletionRequestUserMessage {
                     content: ChatCompletionRequestUserMessageContent::Text(
-                        format!("{}\n\n{}", CLASSIFICATION_PROMPT, context)
+                        format!("{}\n\n{}", prompt, context)
                     ),
                     name: None,
                 }
             )
         ];
-
-        // If vision model is configured, generate text descriptions instead of passing raw images
-        if !image_paths.is_empty() {
-            info!("Generating text descriptions for {} images (reducing context size)", image_paths.len());
-            let descriptions = self.generate_image_descriptions(image_paths).await?;
-            messages.push(ChatCompletionRequestMessage::User(
-                ChatCompletionRequestUserMessage {
-                    content: ChatCompletionRequestUserMessageContent::Text(descriptions),
-                    name: None,
-                },
-            ));
-        }
 
         // Define tools
         let tools = Some(vec![
@@ -114,6 +115,23 @@ impl LLMClient {
                     strict: None,
                 },
             }),
+            ChatCompletionTools::Function(ChatCompletionTool {
+                function: FunctionObject {
+                    name: "describe_image".to_string(),
+                    description: Some("Describe an image by its URL. Downloads the image and returns a detailed text description of what is shown (objects, people, text, scenes, style). ALWAYS call this for any image URL you see — you cannot determine what an image contains from its URL alone. This includes profile picture URLs (e.g. Profile Image: https://...) and image URLs in event content (e.g. .jpg, .png, .gif, .webp).".to_string()),
+                    parameters: Some(serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "url": {
+                                "type": "string",
+                                "description": "The URL of the image to describe"
+                            }
+                        },
+                        "required": ["url"]
+                    })),
+                    strict: None,
+                },
+            }),
         ]);
 
         let request = CreateChatCompletionRequest {
@@ -131,7 +149,7 @@ impl LLMClient {
     }
 
     async fn call_with_tool_handling(&self, mut request: CreateChatCompletionRequest) -> Result<Classification> {
-        let mut max_iterations = 5;
+        let mut max_iterations = 15;
         
         loop {
             if max_iterations == 0 {
@@ -221,8 +239,51 @@ impl LLMClient {
             bail!("LLM returned empty response");
         }
 
+        // Helper: try to parse the raw JSON and convert scores → labels
+        let try_parse = |json_str: &str| -> Option<Classification> {
+            // First try the new scores format
+            if let Ok(raw) = serde_json::from_str::<serde_json::Value>(json_str) {
+                if let Some(scores_map) = raw.get("scores").and_then(|v| v.as_object()) {
+                    let bio = raw.get("bio").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let confidence = raw.get("confidence").and_then(|v| v.as_f64()).unwrap_or(0.5);
+                    
+                    // Build the full scores map
+                    let mut scores: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+                    for (label, score) in scores_map.iter() {
+                        if let Some(s) = score.as_f64() {
+                            scores.insert(label.clone(), s);
+                        }
+                    }
+
+                    // Sort labels by score descending for consistent ordering
+                    let mut scored: Vec<(String, f64)> = scores_map.iter()
+                        .filter_map(|(label, score)| {
+                            let s = score.as_f64()?;
+                            if s >= self.label_min_score {
+                                Some((label.clone(), s))
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                    let labels: Vec<String> = scored.into_iter().map(|(l, _)| l).collect();
+
+                    if !labels.is_empty() || !bio.is_empty() {
+                        return Some(Classification { labels, scores, bio, confidence });
+                    }
+                }
+                
+                // Fallback: try old labels format for backward compatibility
+                if let Ok(c) = serde_json::from_str::<Classification>(json_str) {
+                    return Some(c);
+                }
+            }
+            None
+        };
+
         // Try the whole content first
-        if let Ok(c) = serde_json::from_str::<Classification>(content) {
+        if let Some(c) = try_parse(content) {
             return Ok(c);
         }
 
@@ -233,7 +294,7 @@ impl LLMClient {
             .map(|c| c.trim())
             .unwrap_or(content);
 
-        if let Ok(c) = serde_json::from_str::<Classification>(stripped) {
+        if let Some(c) = try_parse(stripped) {
             return Ok(c);
         }
 
@@ -266,7 +327,7 @@ impl LLMClient {
             }
             if depth == 0 {
                 let json_str = &stripped[start..end];
-                if let Ok(c) = serde_json::from_str::<Classification>(json_str) {
+                if let Some(c) = try_parse(json_str) {
                     return Ok(c);
                 }
             }
@@ -301,6 +362,31 @@ impl LLMClient {
                     None => Ok(format!("Profile not found: {}", pubkey)),
                 }
             }
+            "describe_image" => {
+                let args: serde_json::Value = serde_json::from_str(arguments)
+                    .map_err(|e| anyhow::anyhow!("Invalid JSON arguments: {}", e))?;
+                let url = args.get("url")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow::anyhow!("Missing url"))?;
+
+                match self.image_cache.download(url).await? {
+                    Some((path, hash)) => {
+                        if !crate::image_cache::is_valid_image_path(&path) {
+                            return Ok("Could not download or decode image (invalid format)".to_string());
+                        }
+                        // Check for cached description
+                        match self.db.get_image_description(&hash).await? {
+                            Some(cached) => Ok(cached),
+                            None => {
+                                let desc = self.describe_image(&path).await?;
+                                let _ = self.db.save_image_description(&hash, &desc).await;
+                                Ok(desc)
+                            }
+                        }
+                    }
+                    None => Ok(format!("Could not download image: {}", url)),
+                }
+            }
             _ => Err(anyhow::anyhow!("Unknown tool: {}", name)),
         }
     }
@@ -333,26 +419,6 @@ impl LLMClient {
         Ok(STANDARD.encode(&jpeg_bytes))
     }
 
-    async fn generate_image_descriptions(&self, image_paths: &[String]) -> Result<String> {
-        let mut descriptions = String::from("=== PROFILE IMAGES ===\n\n");
-        
-        for (i, path) in image_paths.iter().enumerate() {
-            info!("Describing image {}/{}: {}", i + 1, image_paths.len(), path);
-            match self.describe_image(path).await {
-                Ok(desc) => {
-                    info!("Image descr {}: {}", path, desc);
-                    descriptions.push_str(&format!("Image {} description: {}\n\n", i + 1, desc));
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to describe image {}: {}", path, e);
-                    descriptions.push_str(&format!("Image {} description: [Failed to generate description]\n\n", i + 1));
-                }
-            }
-        }
-        
-        Ok(descriptions)
-    }
-
     pub async fn describe_image(&self, path: &str) -> Result<String> {
         let image_content = format!("data:image/jpeg;base64,{}", self.encode_image(&path).await?);
 
@@ -383,24 +449,50 @@ impl LLMClient {
         
         Ok(content.to_string())
     }
-}
 
-const CLASSIFICATION_PROMPT: &str = r#"Analyze this Nostr profile activity and generate a classification.
+    fn build_classification_prompt(&self) -> String {
+        let label_list = self.label_taxonomy.iter()
+            .enumerate()
+            .map(|(i, l)| format!("{}. {}", i + 1, l))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        format!(r#"Analyze this Nostr profile activity and score it against a fixed label taxonomy.
 
 Consider:
 - Posts: What topics does the user post about?
 - Reactions: What content do they like/react to? This indicates their interests and agreements.
 - Reposts: What content do they amplify?
 - Zaps received: What content earns them tips?
+- Profile picture and images: Call describe_image for any image URL you see (profile pictures, images in posts). You cannot judge visual content from a URL alone — always call describe_image first.
 
-If a PREVIOUS CLASSIFICATION section is present, use it as context. Refine and update it based on new activity — keep labels that still apply, remove ones that no longer fit, and add any new ones warranted by recent events.
+If a PREVIOUS CLASSIFICATION section is present, use it as context — adjust scores based on new activity.
 
-You have access to tools (get_event, get_profile) to fetch additional context if needed.
+IMPORTANT: Before scoring, call describe_image for every image URL in the profile data. This includes:
+- "Profile Image: https://..." lines
+- Any URLs ending in .jpg, .jpeg, .png, .gif, .webp in event content
+You MUST call describe_image for these URLs — do not skip them or guess what they contain.
+
+LABEL TAXONOMY (score each one):
+{label_list}
+
+Scoring rules:
+- Score each label 0.0–1.0 based on how well it fits the profile
+- 0.0 = not relevant at all, 1.0 = perfectly describes this profile
+- Be selective: most labels should score 0.0 or close to it
+- A label should only score above {min_score} if there is clear evidence in the activity
+- Multiple related labels can score high (e.g. both "bitcoin" and "lightning-network")
+- Use image descriptions to inform labels like "artist", "photographer", "nsfw", "bot" etc.
 
 Generate:
-1. labels: 5-15 searchable tags (e.g., "rust developer", "bitcoin", "privacy advocate", "artist")
+1. scores: An object mapping each label name to its score (0.0–1.0). Include ALL labels, even those scoring 0.0.
 2. bio: A 2-3 sentence neutral summary of who they are based on activity
-3. confidence: 0.0-1.0 indicating how confident you are in the classification
+3. confidence: 0.0-1.0 indicating how confident you are in the overall classification
 
 Output ONLY valid JSON with this exact structure:
-{"labels": ["tag1", "tag2"], "bio": "summary text", "confidence": 0.85}"#;
+{{"scores": {{"label-name": 0.8, ...}}, "bio": "summary text", "confidence": 0.85}}"#,
+            label_list = label_list,
+            min_score = self.label_min_score,
+        )
+    }
+}
