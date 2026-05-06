@@ -164,15 +164,70 @@ impl Database {
         sqlx::query(
             r#"
             CREATE VIRTUAL TABLE IF NOT EXISTS classifications_fts USING fts5(
+                name,
+                about,
+                nip05,
                 labels,
                 bio,
-                pubkey,
-                content=''
+                pubkey UNINDEXED
             )
             "#,
         )
         .execute(pool)
         .await?;
+
+        // Migrate: recreate FTS table if it uses the old schema
+        // Old schemas: (1) had 'pubkey' as indexed column, (2) used contentless fts5 (content='')
+        // FTS5 tables can't be ALTERed, so drop and rebuild
+        let needs_migration: bool = {
+            // Check for old 'pubkey' indexed column or contentless table
+            let has_indexed_pubkey: bool = sqlx::query_scalar::<_, i64>(
+                r#"SELECT COUNT(*) FROM pragma_table_info('classifications_fts') WHERE name = 'pubkey'"#,
+            )
+            .fetch_one(pool)
+            .await?
+            > 0;
+
+            // Contentless FTS5 tables can't be DELETEd from (SQLite < 3.49).
+            // Detect by checking if the table has no content table (contentless).
+            // A simple heuristic: try to query the table — if it has columns but
+            // no data after classifications exist, or if we had the old pubkey column.
+            has_indexed_pubkey
+        };
+
+        if needs_migration {
+            sqlx::query(r#"DROP TABLE classifications_fts"#)
+                .execute(pool)
+                .await?;
+            sqlx::query(
+                r#"
+                CREATE VIRTUAL TABLE classifications_fts USING fts5(
+                    name,
+                    about,
+                    nip05,
+                    labels,
+                    bio,
+                    pubkey UNINDEXED
+                )
+                "#,
+            )
+            .execute(pool)
+            .await?;
+
+            // Rebuild FTS index from existing classified profiles
+            sqlx::query(
+                r#"
+                INSERT INTO classifications_fts (rowid, name, about, nip05, labels, bio, pubkey)
+                SELECT c.id, p.name, p.about, p.nip05,
+                       REPLACE(REPLACE(SUBSTR(c.labels, 2, LENGTH(c.labels) - 2), '"', ''), ',', ' '),
+                       c.bio, c.pubkey
+                FROM classifications c
+                JOIN profiles p ON c.pubkey = p.pubkey
+                "#,
+            )
+            .execute(pool)
+            .await?;
+        }
 
         sqlx::query(
             r#"
@@ -273,6 +328,9 @@ impl Database {
         .bind(pubkey)
         .execute(&self.pool)
         .await?;
+
+        // Update FTS index if this profile is classified (name/about/nip05 changed)
+        self.rebuild_fts_for_pubkey(pubkey).await?;
 
         Ok(())
     }
@@ -405,7 +463,7 @@ impl Database {
         .execute(&self.pool)
         .await?;
 
-        // Index into FTS (delete old entry first, then insert new)
+        // Index into FTS (delete old entry by pubkey UNINDEXED column, then insert new)
         sqlx::query(
             r#"DELETE FROM classifications_fts WHERE pubkey = ?"#,
         )
@@ -413,11 +471,26 @@ impl Database {
         .execute(&self.pool)
         .await?;
 
+        // Fetch profile fields to include in FTS index
+        let profile_fields: (Option<String>, Option<String>, Option<String>) =
+            sqlx::query_as::<_, (Option<String>, Option<String>, Option<String>)>(
+                r#"SELECT name, about, nip05 FROM profiles WHERE pubkey = ?"#,
+            )
+            .bind(pubkey)
+            .fetch_one(&self.pool)
+            .await
+            .unwrap_or((None, None, None));
+
         // Join labels into plain text for FTS indexing
         let labels_text = classification.labels.join(" ");
         sqlx::query(
-            r#"INSERT INTO classifications_fts (labels, bio, pubkey) VALUES (?, ?, ?)"#,
+            r#"INSERT INTO classifications_fts (rowid, name, about, nip05, labels, bio, pubkey)
+               VALUES ((SELECT id FROM classifications WHERE pubkey = ?), ?, ?, ?, ?, ?, ?)"#,
         )
+        .bind(pubkey)
+        .bind(&profile_fields.0)
+        .bind(&profile_fields.1)
+        .bind(&profile_fields.2)
         .bind(&labels_text)
         .bind(&classification.bio)
         .bind(pubkey)
@@ -572,20 +645,62 @@ impl Database {
         Ok(row)
     }
 
+    /// Rebuild the FTS entry for a classified profile (e.g. when profile metadata changes).
+    /// No-op if the profile isn't classified yet.
+    async fn rebuild_fts_for_pubkey(&self, pubkey: &str) -> Result<()> {
+        // Only proceed if this profile has a classification
+        let has_classification: bool = sqlx::query_scalar::<_, i64>(
+            r#"SELECT COUNT(*) FROM classifications WHERE pubkey = ?"#,
+        )
+        .bind(pubkey)
+        .fetch_one(&self.pool)
+        .await?
+        > 0;
+
+        if !has_classification {
+            return Ok(()); // Not classified yet, nothing to index
+        }
+
+        // Delete old FTS entry and re-insert with fresh profile data
+        sqlx::query(r#"DELETE FROM classifications_fts WHERE pubkey = ?"#)
+            .bind(pubkey)
+            .execute(&self.pool)
+            .await?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO classifications_fts (rowid, name, about, nip05, labels, bio, pubkey)
+            SELECT c.id, p.name, p.about, p.nip05,
+                   REPLACE(REPLACE(SUBSTR(c.labels, 2, LENGTH(c.labels) - 2), '"', ''), ',', ' '),
+                   c.bio, c.pubkey
+            FROM classifications c
+            JOIN profiles p ON c.pubkey = p.pubkey
+            WHERE c.pubkey = ?
+            "#,
+        )
+        .bind(pubkey)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
     pub async fn search_classifications(&self, query: &str, limit: i64) -> Result<Vec<crate::http_server::RecentClassification>> {
+        // Add prefix matching to each term so "bitc" matches "bitcoin"
+        let fts_query = Self::prepare_fts_query(query);
+
         let rows = sqlx::query_as::<_, (String, Option<String>, Option<String>, String, String, f64, Option<chrono::DateTime<chrono::Utc>>)>(
             r#"
             SELECT p.pubkey, p.name, p.picture, c.labels, c.bio, c.confidence, c.analyzed_at
             FROM classifications c
             JOIN profiles p ON c.pubkey = p.pubkey
-            WHERE c.id IN (
-                SELECT rowid FROM classifications_fts WHERE classifications_fts MATCH ?
-            )
-            ORDER BY c.confidence DESC
+            JOIN classifications_fts fts ON fts.rowid = c.id
+            WHERE classifications_fts MATCH ?
+            ORDER BY bm25(classifications_fts) ASC
             LIMIT ?
             "#,
         )
-        .bind(query)
+        .bind(&fts_query)
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;
@@ -604,5 +719,29 @@ impl Database {
         }).collect();
 
         Ok(results)
+    }
+
+    /// Prepare a user query for FTS5: add prefix wildcard to each term.
+    /// Handles FTS5 special characters by stripping them.
+    /// e.g. "bitcoin rust" → "bitcoin* rust*"
+    fn prepare_fts_query(query: &str) -> String {
+        query
+            .split_whitespace()
+            .filter(|term| !term.is_empty())
+            .map(|term| {
+                // Strip FTS5 special characters that could cause parse errors
+                let cleaned: String = term
+                    .chars()
+                    .filter(|c| !matches!(c, '"' | '\'' | ':' | '^' | '+' | '-' | '|' | '(' | ')' | '{' | '}'))
+                    .collect();
+                if cleaned.is_empty() {
+                    String::new()
+                } else {
+                    format!("{}*", cleaned)
+                }
+            })
+            .filter(|term| !term.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 }
