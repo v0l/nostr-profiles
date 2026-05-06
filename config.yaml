@@ -2,6 +2,8 @@ llm:
   api_base_url: "http://localhost:8001/v1"
   model: "qwen3.5:122b"
   api_key: ""
+  timeout_secs: 120            # per-request HTTP timeout
+  classify_timeout_secs: 300   # overall timeout for a single classification (all LLM + tool calls)
 
 nostr:
   nsec: ""  # optional: nsec1... or hex secret key for signing

@@ -25,6 +25,7 @@ use async_openai::types::chat::{
     ChatCompletionMessageToolCalls,
 };
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::info;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -45,6 +46,7 @@ pub struct Classifier {
     db: Arc<Database>,
     label_taxonomy: Vec<String>,
     label_min_score: f64,
+    classify_timeout: Duration,
 }
 
 impl Classifier {
@@ -57,7 +59,16 @@ impl Classifier {
             .with_api_base(&config.api_base_url)
             .with_api_key(&config.api_key);
 
-        let client = Client::with_config(openai_config);
+        let http_client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(config.timeout_secs))
+            .build()
+            .expect("failed to build reqwest client");
+
+        let client = Client::with_config(openai_config)
+            .with_http_client(http_client);
+
+        let classify_timeout = Duration::from_secs(config.classify_timeout_secs);
+
         Self {
             client,
             model: config.model.clone(),
@@ -67,6 +78,7 @@ impl Classifier {
             db,
             label_taxonomy,
             label_min_score,
+            classify_timeout,
         }
     }
 
@@ -150,8 +162,19 @@ impl Classifier {
             ..Default::default()
         };
 
-        // Handle tool calls with iterative loop
-        let classification = self.call_with_tool_handling(request).await?;
+        // Handle tool calls with iterative loop, wrapped in an overall timeout
+        let classify_timeout = self.classify_timeout;
+        let classification = tokio::time::timeout(
+            classify_timeout,
+            self.call_with_tool_handling(request),
+        )
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "Classification timed out after {}s",
+                classify_timeout.as_secs()
+            )
+        })??;
         
         Ok(classification)
     }

@@ -17,6 +17,10 @@ pub struct LlmConfig {
     pub api_base_url: String,
     pub model: String,
     pub api_key: String,
+    /// Per-request HTTP timeout in seconds (default: 120)
+    pub timeout_secs: u64,
+    /// Overall classification timeout in seconds, covering all LLM calls + tool calls for a single job (default: 300)
+    pub classify_timeout_secs: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,6 +66,8 @@ pub struct LabelsConfig {
 impl Config {
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self, config::ConfigError> {
         let config = config::Config::builder()
+            .set_default("llm.timeout_secs", 120)?
+            .set_default("llm.classify_timeout_secs", 300)?
             .set_default("processing.min_followers", 1)?
             .set_default("labels.min_score", 0.4)?
             .add_source(config::File::from(path.as_ref()))
