@@ -77,7 +77,17 @@ impl JobQueue {
             let cache_days = self.cache_days;
 
             let worker = tokio::spawn(async move {
-                while let Some(job) = rx.lock().await.recv().await {
+                loop {
+                    // Acquire lock only to receive, then drop it immediately
+                    // so other workers can receive while we process.
+                    let job = {
+                        let mut rx = rx.lock().await;
+                        match rx.recv().await {
+                            Some(job) => job,
+                            None => break, // channel closed
+                        }
+                    };
+
                     let pubkey = job.pubkey.clone();
                     match process_job(&job, &db, &llm, &image_cache, cache_days).await {
                         Ok(_) => {
