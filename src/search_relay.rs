@@ -103,7 +103,7 @@ impl SearchDatabase {
         Ok(events)
     }
 
-    /// Construct a kind 0 (Metadata) event for a given pubkey from our events table.
+    /// Construct a kind 0 (Metadata) event for a given pubkey from the profiles table.
     async fn get_metadata_event_for_pubkey(&self, pubkey_hex: &str) -> Option<Event> {
         // Only return classified profiles from the search relay
         let profile = self.db.get_profile_by_pubkey(pubkey_hex).await.ok()??;
@@ -111,9 +111,9 @@ impl SearchDatabase {
             return None;
         }
 
-        // Try to find the original kind 0 event from our events table
-        if let Ok(Some(event_row)) = self.db.get_metadata_event(pubkey_hex).await {
-            if let Ok(event) = Event::from_json(&event_row.raw_json) {
+        // Use the raw kind 0 event stored on the profiles table
+        if let Some(ref json) = profile.metadata_json {
+            if let Ok(event) = Event::from_json(json) {
                 return Some(event);
             }
         }

@@ -1,20 +1,22 @@
+mod classifier;
 mod config;
 mod db;
 mod format;
 mod http_server;
 mod image_cache;
 mod job_queue;
-mod llm_client;
 mod nostr_client;
 mod nostr_collector;
+mod profile_cache;
 mod search_relay;
 
+use crate::classifier::Classifier;
 use crate::config::Config;
 use crate::db::Database;
 use crate::image_cache::ImageCache;
 use crate::job_queue::JobQueue;
-use crate::llm_client::LLMClient;
 use crate::nostr_client::NostrClient;
+use crate::profile_cache::ProfileCache;
 use anyhow::Result;
 use std::sync::Arc;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
@@ -40,22 +42,25 @@ async fn main() -> Result<()> {
     let db = Arc::new(Database::new(&config.database.path).await?);
     tracing::info!("Database initialized at {}", config.database.path);
 
-    let nostr = NostrClient::new(&config.nostr.relays, config.nostr.nsec.as_deref(), db.clone()).await?;
+    let nostr = NostrClient::new(&config.nostr.relays, config.nostr.nsec.as_deref()).await?;
     nostr.connect().await;
     tracing::info!("Nostr client connected to {} relays", config.nostr.relays.len());
 
     let image_cache = ImageCache::new(&config.image_cache.dir)?;
     tracing::info!("Image cache initialized at {}", config.image_cache.dir);
 
-    let llm = LLMClient::new(
+    let profile_cache = ProfileCache::new(db.clone(), nostr.clone(), 7);
+
+    let classifier = Classifier::new(
         &config.llm,
         nostr.clone(),
+        profile_cache,
         image_cache.clone(),
         db.clone(),
         crate::config::load_label_taxonomy(config.labels.taxonomy_file.as_deref()),
         config.labels.min_score,
     );
-    tracing::info!("LLM client initialized with model {} and {} labels (min_score={})",
+    tracing::info!("Classifier initialized with model {} and {} labels (min_score={})",
         config.llm.model,
         crate::config::load_label_taxonomy(config.labels.taxonomy_file.as_deref()).len(),
         config.labels.min_score
@@ -75,10 +80,10 @@ async fn main() -> Result<()> {
 
     let job_queue_clone = Arc::clone(&job_queue);
     let db_clone = Arc::clone(&db);
-    let llm_clone = llm.clone();
+    let classifier_clone = classifier.clone();
     let image_cache_clone = image_cache.clone();
     let processor_handle = tokio::spawn(async move {
-        job_queue_clone.run(db_clone, llm_clone, image_cache_clone).await;
+        job_queue_clone.run(db_clone, classifier_clone, image_cache_clone).await;
     });
 
     let collector = crate::nostr_collector::NostrCollector;

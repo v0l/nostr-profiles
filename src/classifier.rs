@@ -2,7 +2,9 @@ use crate::config::LlmConfig;
 use crate::db::Database;
 use crate::image_cache::ImageCache;
 use crate::nostr_client::NostrClient;
+use crate::profile_cache::ProfileCache;
 use anyhow::{bail, Result};
+use nostr_sdk::JsonUtil;
 use async_openai::{
     config::OpenAIConfig,
     types::chat::{
@@ -34,18 +36,23 @@ pub struct Classification {
 }
 
 #[derive(Clone)]
-pub struct LLMClient {
+pub struct Classifier {
     client: Client<OpenAIConfig>,
     model: String,
     nostr: NostrClient,
+    profile_cache: ProfileCache,
     image_cache: ImageCache,
     db: Arc<Database>,
     label_taxonomy: Vec<String>,
     label_min_score: f64,
 }
 
-impl LLMClient {
-    pub fn new(config: &LlmConfig, nostr: NostrClient, image_cache: ImageCache, db: Arc<Database>, label_taxonomy: Vec<String>, label_min_score: f64) -> Self {
+impl Classifier {
+    pub fn profile_cache(&self) -> &ProfileCache {
+        &self.profile_cache
+    }
+
+    pub fn new(config: &LlmConfig, nostr: NostrClient, profile_cache: ProfileCache, image_cache: ImageCache, db: Arc<Database>, label_taxonomy: Vec<String>, label_min_score: f64) -> Self {
         let openai_config = OpenAIConfig::new()
             .with_api_base(&config.api_base_url)
             .with_api_key(&config.api_key);
@@ -55,6 +62,7 @@ impl LLMClient {
             client,
             model: config.model.clone(),
             nostr,
+            profile_cache,
             image_cache,
             db,
             label_taxonomy,
@@ -172,7 +180,28 @@ impl LLMClient {
 
             // If the model is done (Stop) and gave us content, parse it regardless of tool_calls
             if has_content && matches!(choice.finish_reason, Some(async_openai::types::chat::FinishReason::Stop)) {
-                return self.parse_classification(content);
+                match self.parse_classification(content) {
+                    Ok(c) => return Ok(c),
+                    Err(e) => {
+                        tracing::warn!("Failed to parse classification, retrying: {}", e);
+                        request.tools = None; // no more tool calls, just fix the JSON
+                        request.messages.push(ChatCompletionRequestMessage::Assistant(
+                            ChatCompletionRequestAssistantMessage {
+                                content: Some(async_openai::types::chat::ChatCompletionRequestAssistantMessageContent::Text(content.to_string())),
+                                ..Default::default()
+                            }
+                        ));
+                        request.messages.push(ChatCompletionRequestMessage::User(
+                            ChatCompletionRequestUserMessage {
+                                content: ChatCompletionRequestUserMessageContent::Text(
+                                    format!("Your previous response could not be parsed as valid JSON: {}. Please output ONLY valid JSON with the exact structure specified.", e)
+                                ),
+                                name: None,
+                            }
+                        ));
+                        continue;
+                    }
+                }
             }
             
             // Check if the model wants to call a tool
@@ -216,7 +245,28 @@ impl LLMClient {
                     ));
                 }
             } else if has_content {
-                return self.parse_classification(content);
+                match self.parse_classification(content) {
+                    Ok(c) => return Ok(c),
+                    Err(e) => {
+                        tracing::warn!("Failed to parse classification, retrying: {}", e);
+                        request.tools = None;
+                        request.messages.push(ChatCompletionRequestMessage::Assistant(
+                            ChatCompletionRequestAssistantMessage {
+                                content: Some(async_openai::types::chat::ChatCompletionRequestAssistantMessageContent::Text(content.to_string())),
+                                ..Default::default()
+                            }
+                        ));
+                        request.messages.push(ChatCompletionRequestMessage::User(
+                            ChatCompletionRequestUserMessage {
+                                content: ChatCompletionRequestUserMessageContent::Text(
+                                    format!("Your previous response could not be parsed as valid JSON: {}. Please output ONLY valid JSON with the exact structure specified.", e)
+                                ),
+                                name: None,
+                            }
+                        ));
+                        continue;
+                    }
+                }
             } else {
                 tracing::warn!("LLM returned no content and no tool calls, retrying without tools");
                 request.tools = None;
@@ -345,8 +395,21 @@ impl LLMClient {
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| anyhow::anyhow!("Missing event_id"))?;
 
-                match self.nostr.fetch_event(event_id).await? {
-                    Some(event) => Ok(crate::format::describe_event(&event)),
+                // Check DB cache first
+                if let Some(cached) = self.db.get_event(event_id).await? {
+                    if let Ok(event) = nostr_sdk::Event::from_json(&cached.raw_json) {
+                        return Ok(crate::format::describe_event(&event));
+                    }
+                }
+
+                // Fetch from relays and cache
+                match self.nostr.fetch_event_by_id(event_id).await? {
+                    Some(event) => {
+                        if let Err(e) = self.db.cache_event(&event).await {
+                            tracing::warn!("Failed to cache fetched event {}: {}", event_id, e);
+                        }
+                        Ok(crate::format::describe_event(&event))
+                    }
                     None => Ok(format!("Event not found: {}", event_id)),
                 }
             }
@@ -357,7 +420,7 @@ impl LLMClient {
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| anyhow::anyhow!("Missing pubkey"))?;
 
-                match self.nostr.fetch_profile(pubkey).await? {
+                match self.profile_cache.get_profile(pubkey).await? {
                     Some(profile) => Ok(crate::format::describe_profile(&profile)),
                     None => Ok(format!("Profile not found: {}", pubkey)),
                 }
@@ -459,12 +522,42 @@ impl LLMClient {
 
         format!(r#"Analyze this Nostr profile activity and score it against a fixed label taxonomy.
 
-Consider:
-- Posts: What topics does the user post about?
+Nostr event tags are how users reference other users and content. Understanding them is critical for classification:
+
+- ["e", "<event_id>"] — references another event. Used in replies, reactions, and reposts.
+- ["e", "<event_id>", "<relay_url>", "<marker>", "<pubkey>"] — marked e tag. The marker is "root" (the event starting a thread) or "reply" (the direct parent being responded to). This tells you the user is replying in a conversation.
+- ["p", "<pubkey>"] — mentions or notifies another user. Frequent ["p", ...] tags to the same pubkey indicate a social connection or ongoing conversation.
+- ["a", "<kind>:<pubkey>:<d-tag>"] — references a replaceable or parameterized event by its coordinate. Common for referencing long-form articles (kind 30023), channels, or communities.
+- ["q", "<event_id>", "<relay_url>", "<pubkey>"] — quote repost. Unlike e tags (which are replies in a thread), q tags mean the user is quoting another event in their own post. This is NOT a reply — it's a citation. Used in kind 1 posts that reference other notes via nostr:nevent:... URIs.
+- ["k", "<kind_number>"] — indicates the kind of the event being referenced (used in reactions kind 7, generic reposts kind 16, and external content reactions kind 17).
+
+Zap events (kind 9735 = zap receipt) are particularly rich signals:
+- The 9735 event's pubkey is the recipient's LNURL server (not the sender or receiver).
+- The ["p", "<pubkey>"] tag is the zap RECIPIENT's pubkey.
+- The ["P", "<pubkey>"] tag (uppercase) is the zap SENDER's pubkey.
+- The ["e", "<event_id>"] tag (if present) is the event being zapped.
+- The ["bolt11", "..."] tag contains the lightning invoice, which encodes the amount in millisats.
+- The ["description", "..."] tag contains the full JSON of the original kind 9734 zap request, which includes:
+  - The sender's pubkey (the 9734 event's pubkey field)
+  - An optional message in the content field (zap comment)
+  - The ["amount", "<millisats>"] tag for the payment amount
+  - The ["e", "..."] and ["p", "..."] tags from the request
+- The ["amount", "<millisats>"] tag may also appear directly on the 9735.
+
+When you see a 9735 event in a user's activity, parse the description tag to understand who sent the zap, how much, and what event or profile it was for. Zaps received indicate what content the user's audience values.
+
+When you see these tags, consider what the user is interacting with — replying to specific posts (e tags with "reply" marker), quoting content (q tags), mentioning people (p tags), or joining communities (a tags) all reveal interests and social connections.
+
+Consider all available signals:
+- Posts: What topics does the user post about? What tone and expertise level do they show?
+- Replies (events with ["e", ...] tags): Who do they interact with? What topics do they engage with? What communities are they part of?
+- Mentions (["p", ...] tags): Who do they talk to or about? Frequent mentions of the same pubkey suggest a close social connection.
 - Reactions: What content do they like/react to? This indicates their interests and agreements.
-- Reposts: What content do they amplify?
-- Zaps received: What content earns them tips?
+- Reposts: What content do they amplify? This shows what they want to associate with.
+- Zaps received: What content earns them tips? This shows what their audience values.
+- Zaps sent: Who do they tip? This shows who they support.
 - Profile picture and images: Call describe_image for any image URL you see (profile pictures, images in posts). You cannot judge visual content from a URL alone — always call describe_image first.
+- Profile metadata: Name, about section, NIP-05 domain, and picture can all signal identity and interests.
 
 If a PREVIOUS CLASSIFICATION section is present, use it as context — adjust scores based on new activity.
 
@@ -483,10 +576,16 @@ Scoring rules:
 - A label should only score above {min_score} if there is clear evidence in the activity
 - Multiple related labels can score high (e.g. both "bitcoin" and "lightning-network")
 - Use image descriptions to inform labels like "artist", "photographer", "nsfw", "bot" etc.
+- Consider the depth of engagement: someone who occasionally mentions bitcoin is different from someone who posts about it daily
 
 Generate:
 1. scores: An object mapping each label name to its score (0.0–1.0). Include ALL labels, even those scoring 0.0.
-2. bio: A 2-3 sentence neutral summary of who they are based on activity
+2. bio: A rich, detailed summary of this person based on their activity. Cover:
+   - Their primary interests and expertise areas
+   - Their role in communities (creator, commentator, builder, organizer, etc.)
+   - Notable patterns in their behavior or content
+   - Any distinctive characteristics that set them apart
+   Do NOT start with "A Nostr user" — that is a given. Start with what distinguishes them. Write as much as needed to capture their profile fully.
 3. confidence: 0.0-1.0 indicating how confident you are in the overall classification
 
 Output ONLY valid JSON with this exact structure:

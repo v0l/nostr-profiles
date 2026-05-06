@@ -1,4 +1,5 @@
 use anyhow::Result;
+use nostr_sdk::JsonUtil;
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, SqlitePool};
 
@@ -51,6 +52,8 @@ pub struct Profile {
     pub is_classified: bool,
     pub needs_processing: bool,
     pub follower_count: Option<i64>,
+    pub metadata_json: Option<String>,
+    pub metadata_created_at: Option<i64>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -125,11 +128,12 @@ impl Database {
         sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS events (
-                id TEXT PRIMARY KEY,
+                id TEXT NOT NULL,
                 pubkey TEXT NOT NULL,
                 kind INTEGER NOT NULL,
                 created_at INTEGER NOT NULL,
-                raw_json TEXT NOT NULL
+                raw_json TEXT NOT NULL,
+                PRIMARY KEY (id, pubkey)
             )
             "#,
         )
@@ -265,6 +269,71 @@ impl Database {
         .execute(pool)
         .await;
 
+        // Migrate: add metadata_json column if missing (stores raw kind 0 event for relay)
+        let _ = sqlx::query(
+            r#"ALTER TABLE profiles ADD COLUMN metadata_json TEXT"#,
+        )
+        .execute(pool)
+        .await;
+
+        // Migrate: add metadata_created_at column if missing (nostr event timestamp for kind 0)
+        let _ = sqlx::query(
+            r#"ALTER TABLE profiles ADD COLUMN metadata_created_at INTEGER"#,
+        )
+        .execute(pool)
+        .await;
+
+        // Migrate: events table composite PK (id, pubkey) to allow same event under multiple pubkeys
+        // (needed for zap receipts attributed to both LNURL server and sender)
+        let needs_events_migration: bool = {
+            // Check if PK is just 'id' (old) vs composite (new)
+            let pk_cols: Vec<String> = sqlx::query_as::<_, (String,)>(
+                r#"SELECT name FROM pragma_table_info('events') WHERE pk > 0 ORDER BY pk"#,
+            )
+            .fetch_all(pool)
+            .await
+            .map(|rows| rows.into_iter().map(|(n,)| n).collect())
+            .unwrap_or_default();
+
+            // Old schema: only 'id' is PK. New schema: both 'id' and 'pubkey' are PK.
+            !pk_cols.contains(&"pubkey".to_string())
+        };
+
+        if needs_events_migration {
+            tracing::info!("Migrating events table to composite primary key (id, pubkey)...");
+            sqlx::query(r#"CREATE TABLE events_new (
+                id TEXT NOT NULL,
+                pubkey TEXT NOT NULL,
+                kind INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                raw_json TEXT NOT NULL,
+                PRIMARY KEY (id, pubkey)
+            )"#)
+            .execute(pool)
+            .await?;
+
+            sqlx::query(r#"INSERT OR IGNORE INTO events_new SELECT * FROM events"#)
+                .execute(pool)
+                .await?;
+
+            sqlx::query(r#"DROP TABLE events"#)
+                .execute(pool)
+                .await?;
+
+            sqlx::query(r#"ALTER TABLE events_new RENAME TO events"#)
+                .execute(pool)
+                .await?;
+
+            sqlx::query(
+                r#"CREATE INDEX IF NOT EXISTS idx_events_pubkey_kind 
+                ON events(pubkey, kind, created_at)"#,
+            )
+            .execute(pool)
+            .await?;
+
+            tracing::info!("Events table migration complete");
+        }
+
         Ok(())
     }
 
@@ -295,14 +364,14 @@ impl Database {
 
         // Kind 0 = metadata — extract profile fields and update
         if kind == 0 {
-            self.update_profile_metadata(&pubkey, &event.content).await?;
+            self.update_profile_metadata(&pubkey, &event.content, &raw_json, created_at).await?;
         }
 
         sqlx::query(
             r#"
             INSERT INTO events (id, pubkey, kind, created_at, raw_json)
             VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(id) DO NOTHING
+            ON CONFLICT(id, pubkey) DO NOTHING
             "#,
         )
         .bind(&event_id)
@@ -313,20 +382,57 @@ impl Database {
         .execute(&self.pool)
         .await?;
 
+        // For zap receipts (kind 9735), also index under the sender's pubkey.
+        // Parse the description tag which contains the full 9734 zap request.
+        // Verify the signature to ensure the sender pubkey is authentic.
+        if kind == 9735 {
+            if let Some(zap_request_json) = event.tags.iter()
+                .filter_map(|t| match t.as_standardized() {
+                    Some(nostr_sdk::TagStandard::Description(desc)) => Some(desc.as_str()),
+                    _ => None,
+                })
+                .next()
+            {
+                if let Ok(zap_request) = nostr_sdk::Event::from_json(zap_request_json) {
+                    if zap_request.verify().is_ok() {
+                        let sender_pubkey = zap_request.pubkey.to_hex();
+                        self.upsert_profile(&sender_pubkey).await?;
+                        sqlx::query(
+                            r#"
+                            INSERT INTO events (id, pubkey, kind, created_at, raw_json)
+                            VALUES (?, ?, ?, ?, ?)
+                            ON CONFLICT(id, pubkey) DO NOTHING
+                            "#,
+                        )
+                        .bind(&event_id)
+                        .bind(&sender_pubkey)
+                        .bind(kind)
+                        .bind(created_at)
+                        .bind(&raw_json)
+                        .execute(&self.pool)
+                        .await?;
+                    } else {
+                        tracing::warn!("Zap receipt {} has invalid 9734 signature, skipping sender indexing", event_id);
+                    }
+                }
+            }
+        }
+
         Ok(())
     }
 
-    async fn update_profile_metadata(&self, pubkey: &str, content: &str) -> Result<()> {
-        let meta: serde_json::Value = match serde_json::from_str(content) {
+    async fn update_profile_metadata(&self, pubkey: &str, content: &str, metadata_json: &str, nostr_created_at: i64) -> Result<()> {
+        let meta: nostr_sdk::Metadata = match serde_json::from_str(content) {
             Ok(v) => v,
             Err(_) => return Ok(()), // skip unparseable metadata
         };
 
-        let name = meta.get("name").and_then(|v| v.as_str());
-        let about = meta.get("about").and_then(|v| v.as_str());
-        let picture = meta.get("picture").and_then(|v| v.as_str());
-        let nip05 = meta.get("nip05").and_then(|v| v.as_str());
+        let name = meta.name.as_deref();
+        let about = meta.about.as_deref();
+        let picture = meta.picture.as_deref();
+        let nip05 = meta.nip05.as_deref();
 
+        // Only update if this metadata event is newer than what we have
         sqlx::query(
             r#"
             UPDATE profiles SET
@@ -334,15 +440,20 @@ impl Database {
                 about = COALESCE(?, about),
                 picture = COALESCE(?, picture),
                 nip05 = COALESCE(?, nip05),
+                metadata_json = ?,
+                metadata_created_at = ?,
                 updated_at = CURRENT_TIMESTAMP
-            WHERE pubkey = ?
+            WHERE pubkey = ? AND (metadata_created_at IS NULL OR metadata_created_at < ?)
             "#,
         )
         .bind(name)
         .bind(about)
         .bind(picture)
         .bind(nip05)
+        .bind(metadata_json)
+        .bind(nostr_created_at)
         .bind(pubkey)
+        .bind(nostr_created_at)
         .execute(&self.pool)
         .await?;
 
@@ -389,7 +500,7 @@ impl Database {
 
     pub async fn get_profile_details(&self, pubkey: &str) -> Result<Profile> {
         let profile = sqlx::query_as::<_, Profile>(
-            r#"SELECT pubkey, nip05, name, about, picture, is_classified, needs_processing, follower_count, created_at, updated_at FROM profiles WHERE pubkey = ?"#,
+            r#"SELECT pubkey, nip05, name, about, picture, is_classified, needs_processing, follower_count, metadata_json, created_at, updated_at FROM profiles WHERE pubkey = ?"#,
         )
         .bind(pubkey)
         .fetch_one(&self.pool)
@@ -432,7 +543,7 @@ impl Database {
 
     pub async fn get_profile_by_pubkey(&self, pubkey: &str) -> Result<Option<Profile>> {
         let profile = sqlx::query_as::<_, Profile>(
-            r#"SELECT pubkey, nip05, name, about, picture, is_classified, needs_processing, follower_count, created_at, updated_at FROM profiles WHERE pubkey = ?"#,
+            r#"SELECT pubkey, nip05, name, about, picture, is_classified, needs_processing, follower_count, metadata_json, metadata_created_at, created_at, updated_at FROM profiles WHERE pubkey = ?"#,
         )
         .bind(pubkey)
         .fetch_optional(&self.pool)
@@ -666,17 +777,6 @@ impl Database {
         }).collect();
 
         Ok(results)
-    }
-
-    pub async fn get_metadata_event(&self, pubkey: &str) -> Result<Option<Event>> {
-        let row = sqlx::query_as::<_, Event>(
-            r#"SELECT id, pubkey, kind, created_at, raw_json FROM events WHERE pubkey = ? AND kind = 0 ORDER BY created_at DESC LIMIT 1"#,
-        )
-        .bind(pubkey)
-        .fetch_optional(&self.pool)
-        .await?;
-
-        Ok(row)
     }
 
     /// Rebuild the FTS entry for a classified profile (e.g. when profile metadata changes).

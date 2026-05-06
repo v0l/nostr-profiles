@@ -1,5 +1,5 @@
 use crate::db::Database;
-use crate::llm_client::LLMClient;
+use crate::classifier::Classifier;
 use crate::image_cache::ImageCache;
 use anyhow::Result;
 use std::collections::HashSet;
@@ -64,14 +64,14 @@ impl JobQueue {
         queued.remove(pubkey);
     }
 
-    pub async fn run(&self, db: Arc<Database>, llm: LLMClient, image_cache: ImageCache) {
+    pub async fn run(&self, db: Arc<Database>, classifier: Classifier, image_cache: ImageCache) {
         let mut workers = Vec::new();
         let queue_clone = self.clone_for_worker();
 
         for i in 0..self.max_workers {
             let rx = self.rx.clone();
             let db = db.clone();
-            let llm = llm.clone();
+            let classifier = classifier.clone();
             let image_cache = image_cache.clone();
             let queue = queue_clone.clone();
             let cache_days = self.cache_days;
@@ -89,7 +89,7 @@ impl JobQueue {
                     };
 
                     let pubkey = job.pubkey.clone();
-                    match process_job(&job, &db, &llm, &image_cache, cache_days).await {
+                    match process_job(&job, &db, &classifier, &image_cache, cache_days).await {
                         Ok(_) => {
                             tracing::info!(
                                 "Worker {} successfully processed profile {}",
@@ -131,7 +131,7 @@ impl JobQueue {
 async fn process_job(
     job: &Job,
     db: &Database,
-    llm: &LLMClient,
+    classifier: &Classifier,
     _image_cache: &ImageCache,
     cache_days: u64,
 ) -> Result<()> {
@@ -140,7 +140,10 @@ async fn process_job(
 
     let events = db.get_profile_events(pubkey, 50).await?;
 
-    // Get profile details
+    // Ensure we have profile metadata — fetch from relays if missing
+    if let Err(e) = classifier.profile_cache().ensure_metadata(pubkey).await {
+        tracing::warn!("Failed to ensure metadata for {}: {}", pubkey, e);
+    }
     let profile = db.get_profile_details(pubkey).await.ok();
 
     // Get previous classification if this is a re-classification
@@ -159,7 +162,7 @@ async fn process_job(
         if previous_classification.is_some() { " (re-classification)" } else { "" }
     );
 
-    let classification = llm
+    let classification = classifier
         .classify(&context)
         .await?;
 
