@@ -1,0 +1,597 @@
+use anyhow::Result;
+use serde::{Deserialize, Serialize};
+use sqlx::{FromRow, SqlitePool};
+
+/// Kinds that are useful for classifying a profile.
+/// We only count and fetch these when determining if someone should be classified.
+///
+/// Based on NIPs: https://github.com/nostr-protocol/nips
+///
+/// - 0:      Metadata (profile info) — NIP-01
+/// - 1:      Short Text Note — NIP-10
+/// - 6:      Repost — NIP-18
+/// - 7:      Reaction — NIP-25
+/// - 16:     Generic Repost — NIP-18
+/// - 17:     Reaction to a website — NIP-25
+/// - 20:     Picture — NIP-68
+/// - 21:     Video Event — NIP-71
+/// - 22:     Short-form Portrait Video — NIP-71
+/// - 1111:   Comment — NIP-22
+/// - 9735:   Zap Receipt — NIP-57
+/// - 9802:   Highlights — NIP-84
+/// - 30023:  Long-form Content — NIP-23
+pub const CLASSIFIABLE_KINDS: &[u16] = &[
+    0,      // Metadata
+    1,      // Short Text Note
+    6,      // Repost
+    7,      // Reaction
+    16,     // Generic Repost
+    17,     // Reaction to a website
+    20,     // Picture
+    21,     // Video Event
+    22,     // Short-form Portrait Video
+    1111,   // Comment
+    9735,   // Zap Receipt
+    9802,   // Highlights
+    30023,  // Long-form Content
+];
+
+/// Check if a nostr event kind is relevant for profile classification.
+pub fn is_classifiable_kind(kind: u16) -> bool {
+    CLASSIFIABLE_KINDS.contains(&kind)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct Profile {
+    pub pubkey: String,
+    pub nip05: Option<String>,
+    pub name: Option<String>,
+    pub about: Option<String>,
+    pub picture: Option<String>,
+    pub is_classified: bool,
+    pub needs_processing: bool,
+    pub follower_count: Option<i64>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct Event {
+    pub id: String,
+    pub pubkey: String,
+    pub kind: i64,
+    pub created_at: i64,
+    pub raw_json: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Classification {
+    pub labels: Vec<String>,
+    pub bio: String,
+    pub confidence: f64,
+}
+
+#[derive(Clone)]
+pub struct Database {
+    pub pool: SqlitePool,
+}
+
+impl Database {
+    pub async fn new(path: &str) -> Result<Self> {
+        // Create database file with proper permissions if it doesn't exist
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        
+        let path = std::path::Path::new(path);
+        if !path.exists() {
+            // Create parent directories if needed
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            // Create file with read/write permissions for owner only
+            fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .open(path)?;
+            // Set permissions to 0600 (rw-------)
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+        }
+        
+        let pool = SqlitePool::connect(path.to_str().unwrap()).await?;
+        Self::migrate(&pool).await?;
+        Ok(Self { pool })
+    }
+
+    async fn migrate(pool: &SqlitePool) -> Result<()> {
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS profiles (
+                pubkey TEXT PRIMARY KEY,
+                nip05 TEXT,
+                name TEXT,
+                about TEXT,
+                picture TEXT,
+                is_classified BOOLEAN DEFAULT FALSE,
+                needs_processing BOOLEAN DEFAULT FALSE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            "#,
+        )
+        .execute(pool)
+        .await?;
+
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS events (
+                id TEXT PRIMARY KEY,
+                pubkey TEXT NOT NULL,
+                kind INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                raw_json TEXT NOT NULL
+            )
+            "#,
+        )
+        .execute(pool)
+        .await?;
+
+        sqlx::query(
+            r#"
+            CREATE INDEX IF NOT EXISTS idx_events_pubkey_kind 
+            ON events(pubkey, kind, created_at)
+            "#,
+        )
+        .execute(pool)
+        .await?;
+
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS classifications (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                pubkey TEXT NOT NULL UNIQUE,
+                labels TEXT NOT NULL,
+                bio TEXT NOT NULL,
+                confidence REAL,
+                analyzed_event_count INTEGER,
+                analyzed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (pubkey) REFERENCES profiles(pubkey)
+            )
+            "#,
+        )
+        .execute(pool)
+        .await?;
+
+        sqlx::query(
+            r#"
+            CREATE VIRTUAL TABLE IF NOT EXISTS classifications_fts USING fts5(
+                labels,
+                bio,
+                pubkey,
+                content=''
+            )
+            "#,
+        )
+        .execute(pool)
+        .await?;
+
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS image_descriptions (
+                hash TEXT PRIMARY KEY,
+                description TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            "#,
+        )
+        .execute(pool)
+        .await?;
+
+        // Migrate: add follower_count column if missing
+        let _ = sqlx::query(
+            r#"ALTER TABLE profiles ADD COLUMN follower_count INTEGER"#,
+        )
+        .execute(pool)
+        .await;
+
+        Ok(())
+    }
+
+    pub async fn upsert_profile(&self, pubkey: &str) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO profiles (pubkey, needs_processing)
+            VALUES (?, FALSE)
+            ON CONFLICT(pubkey) DO UPDATE SET
+                updated_at = CURRENT_TIMESTAMP
+            "#,
+        )
+        .bind(pubkey)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn cache_event(&self, event: &nostr_sdk::Event) -> Result<()> {
+        let event_id = event.id.to_hex();
+        let pubkey = event.pubkey.to_hex();
+        let kind = (event.kind.as_u16() as u32) as i64;
+        let created_at = event.created_at.as_secs() as i64;
+        let raw_json = serde_json::to_string(event)?;
+        
+        // Ensure profile exists first (for foreign key constraint)
+        self.upsert_profile(&pubkey).await?;
+
+        // Kind 0 = metadata — extract profile fields and update
+        if kind == 0 {
+            self.update_profile_metadata(&pubkey, &event.content).await?;
+        }
+
+        sqlx::query(
+            r#"
+            INSERT INTO events (id, pubkey, kind, created_at, raw_json)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO NOTHING
+            "#,
+        )
+        .bind(&event_id)
+        .bind(&pubkey)
+        .bind(kind)
+        .bind(created_at)
+        .bind(&raw_json)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    async fn update_profile_metadata(&self, pubkey: &str, content: &str) -> Result<()> {
+        let meta: serde_json::Value = match serde_json::from_str(content) {
+            Ok(v) => v,
+            Err(_) => return Ok(()), // skip unparseable metadata
+        };
+
+        let name = meta.get("name").and_then(|v| v.as_str());
+        let about = meta.get("about").and_then(|v| v.as_str());
+        let picture = meta.get("picture").and_then(|v| v.as_str());
+        let nip05 = meta.get("nip05").and_then(|v| v.as_str());
+
+        sqlx::query(
+            r#"
+            UPDATE profiles SET
+                name = COALESCE(?, name),
+                about = COALESCE(?, about),
+                picture = COALESCE(?, picture),
+                nip05 = COALESCE(?, nip05),
+                updated_at = CURRENT_TIMESTAMP
+            WHERE pubkey = ?
+            "#,
+        )
+        .bind(name)
+        .bind(about)
+        .bind(picture)
+        .bind(nip05)
+        .bind(pubkey)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    pub async fn get_profile_event_count(&self, pubkey: &str) -> Result<usize> {
+        let kinds: Vec<i64> = CLASSIFIABLE_KINDS.iter().map(|k| *k as i64).collect();
+        let placeholders = kinds.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT COUNT(*) FROM events WHERE pubkey = ? AND kind IN ({})",
+            placeholders
+        );
+
+        let mut query = sqlx::query_scalar::<_, i64>(&sql).bind(pubkey);
+        for kind in &kinds {
+            query = query.bind(*kind);
+        }
+        let count = query.fetch_one(&self.pool).await?;
+
+        Ok(count as usize)
+    }
+
+    pub async fn get_profile(&self, pubkey: &str) -> Result<(usize, bool)> {
+        let kinds: Vec<i64> = CLASSIFIABLE_KINDS.iter().map(|k| *k as i64).collect();
+        let placeholders = kinds.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT (SELECT COUNT(*) FROM events WHERE pubkey = ? AND kind IN ({})), is_classified FROM profiles WHERE pubkey = ?",
+            placeholders
+        );
+
+        let mut query = sqlx::query_as::<_, (i64, bool)>(&sql)
+            .bind(pubkey);
+        for kind in &kinds {
+            query = query.bind(*kind);
+        }
+        let (count, is_classified) = query.bind(pubkey).fetch_one(&self.pool).await?;
+
+        Ok((count as usize, is_classified))
+    }
+
+    pub async fn get_profile_details(&self, pubkey: &str) -> Result<Profile> {
+        let profile = sqlx::query_as::<_, Profile>(
+            r#"SELECT pubkey, nip05, name, about, picture, is_classified, needs_processing, follower_count, created_at, updated_at FROM profiles WHERE pubkey = ?"#,
+        )
+        .bind(pubkey)
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(profile)
+    }
+
+    pub async fn get_profile_events(
+        &self,
+        pubkey: &str,
+        limit: usize,
+    ) -> Result<Vec<Event>> {
+        let kinds: Vec<i64> = CLASSIFIABLE_KINDS.iter().map(|k| *k as i64).collect();
+        let placeholders = kinds.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT id, pubkey, kind, created_at, raw_json FROM events WHERE pubkey = ? AND kind IN ({}) ORDER BY created_at DESC LIMIT ?",
+            placeholders
+        );
+
+        let mut query = sqlx::query_as::<_, Event>(&sql).bind(pubkey);
+        for kind in &kinds {
+            query = query.bind(*kind);
+        }
+        let rows = query.bind(limit as i64).fetch_all(&self.pool).await?;
+
+        Ok(rows)
+    }
+
+    pub async fn get_event(&self, event_id: &str) -> Result<Option<Event>> {
+        let row = sqlx::query_as::<_, Event>(
+            r#"SELECT id, pubkey, kind, created_at, raw_json FROM events WHERE id = ?"#,
+        )
+        .bind(event_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row)
+    }
+
+    pub async fn get_profile_by_pubkey(&self, pubkey: &str) -> Result<Option<Profile>> {
+        let profile = sqlx::query_as::<_, Profile>(
+            r#"SELECT pubkey, nip05, name, about, picture, is_classified, needs_processing, follower_count, created_at, updated_at FROM profiles WHERE pubkey = ?"#,
+        )
+        .bind(pubkey)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(profile)
+    }
+
+    pub async fn set_follower_count(&self, pubkey: &str, count: usize) -> Result<()> {
+        sqlx::query(
+            r#"UPDATE profiles SET follower_count = ?, updated_at = CURRENT_TIMESTAMP WHERE pubkey = ?"#,
+        )
+        .bind(count as i64)
+        .bind(pubkey)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn save_classification(
+        &self,
+        pubkey: &str,
+        classification: &Classification,
+        event_count: usize,
+    ) -> Result<()> {
+        let labels = serde_json::to_string(&classification.labels)?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO classifications (pubkey, labels, bio, confidence, analyzed_event_count)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(pubkey) DO UPDATE SET
+                labels = excluded.labels,
+                bio = excluded.bio,
+                confidence = excluded.confidence,
+                analyzed_event_count = excluded.analyzed_event_count,
+                analyzed_at = CURRENT_TIMESTAMP
+            "#,
+        )
+        .bind(pubkey)
+        .bind(&labels)
+        .bind(&classification.bio)
+        .bind(classification.confidence)
+        .bind(event_count as i64)
+        .execute(&self.pool)
+        .await?;
+
+        // Index into FTS (delete old entry first, then insert new)
+        sqlx::query(
+            r#"DELETE FROM classifications_fts WHERE pubkey = ?"#,
+        )
+        .bind(pubkey)
+        .execute(&self.pool)
+        .await?;
+
+        // Join labels into plain text for FTS indexing
+        let labels_text = classification.labels.join(" ");
+        sqlx::query(
+            r#"INSERT INTO classifications_fts (labels, bio, pubkey) VALUES (?, ?, ?)"#,
+        )
+        .bind(&labels_text)
+        .bind(&classification.bio)
+        .bind(pubkey)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    pub async fn mark_profile_classified(&self, pubkey: &str) -> Result<()> {
+        sqlx::query(
+            r#"
+            UPDATE profiles 
+            SET is_classified = TRUE,
+                needs_processing = FALSE,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE pubkey = ?
+            "#,
+        )
+        .bind(pubkey)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    pub async fn get_classification(&self, pubkey: &str) -> Result<Classification> {
+        let (labels, bio, confidence) = sqlx::query_as::<_, (String, String, f64)>(
+            r#"SELECT labels, bio, confidence FROM classifications WHERE pubkey = ?"#,
+        )
+        .bind(pubkey)
+        .fetch_one(&self.pool)
+        .await?;
+
+        let labels: Vec<String> = serde_json::from_str(&labels)
+            .map_err(|e| anyhow::anyhow!("Failed to parse labels: {}", e))?;
+
+        Ok(Classification {
+            labels,
+            bio,
+            confidence,
+        })
+    }
+
+    pub async fn get_classification_if_exists(&self, pubkey: &str) -> Result<Option<Classification>> {
+        let result = sqlx::query_as::<_, (String, String, f64)>(
+            r#"SELECT labels, bio, confidence FROM classifications WHERE pubkey = ?"#,
+        )
+        .bind(pubkey)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        match result {
+            Some((labels, bio, confidence)) => {
+                let labels: Vec<String> = serde_json::from_str(&labels)
+                    .map_err(|e| anyhow::anyhow!("Failed to parse labels: {}", e))?;
+                Ok(Some(Classification {
+                    labels,
+                    bio,
+                    confidence,
+                }))
+            }
+            None => Ok(None),
+        }
+    }
+
+    pub async fn get_image_description(&self, hash: &str) -> Result<Option<String>> {
+        let desc = sqlx::query_scalar::<_, String>(
+            r#"SELECT description FROM image_descriptions WHERE hash = ?"#,
+        )
+        .bind(hash)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(desc)
+    }
+
+    pub async fn save_image_description(&self, hash: &str, description: &str) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO image_descriptions (hash, description)
+            VALUES (?, ?)
+            ON CONFLICT(hash) DO NOTHING
+            "#,
+        )
+        .bind(hash)
+        .bind(description)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    pub async fn delete_old_events_for_pubkey(&self, pubkey: &str, max_age_days: u64) -> Result<u64> {
+        let cutoff = chrono::Utc::now() - chrono::Duration::days(max_age_days as i64);
+        let cutoff_ts = cutoff.timestamp();
+
+        let kinds: Vec<i64> = CLASSIFIABLE_KINDS.iter().map(|k| *k as i64).collect();
+        let placeholders = kinds.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "DELETE FROM events WHERE pubkey = ? AND created_at < ? AND kind IN ({})",
+            placeholders
+        );
+
+        let mut query = sqlx::query(&sql).bind(pubkey).bind(cutoff_ts);
+        for kind in &kinds {
+            query = query.bind(*kind);
+        }
+        let result = query.execute(&self.pool).await?;
+
+        Ok(result.rows_affected())
+    }
+
+    pub async fn get_recent_classifications(&self, limit: i64) -> Result<Vec<crate::http_server::RecentClassification>> {
+        let rows = sqlx::query_as::<_, (String, Option<String>, Option<String>, String, String, f64, Option<chrono::DateTime<chrono::Utc>>)>(
+            r#"
+            SELECT p.pubkey, p.name, p.picture, c.labels, c.bio, c.confidence, c.analyzed_at
+            FROM classifications c
+            JOIN profiles p ON c.pubkey = p.pubkey
+            ORDER BY c.analyzed_at DESC
+            LIMIT ?
+            "#,
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let results = rows.into_iter().map(|(pubkey, name, picture, labels, bio, confidence, analyzed_at)| {
+            let parsed_labels: Vec<String> = serde_json::from_str(&labels).unwrap_or_default();
+            crate::http_server::RecentClassification {
+                pubkey,
+                name,
+                picture,
+                labels: parsed_labels,
+                bio,
+                confidence,
+                analyzed_at: analyzed_at.map(|t| t.to_rfc3339()),
+            }
+        }).collect();
+
+        Ok(results)
+    }
+
+    pub async fn search_classifications(&self, query: &str, limit: i64) -> Result<Vec<crate::http_server::RecentClassification>> {
+        let rows = sqlx::query_as::<_, (String, Option<String>, Option<String>, String, String, f64, Option<chrono::DateTime<chrono::Utc>>)>(
+            r#"
+            SELECT p.pubkey, p.name, p.picture, c.labels, c.bio, c.confidence, c.analyzed_at
+            FROM classifications c
+            JOIN profiles p ON c.pubkey = p.pubkey
+            WHERE c.id IN (
+                SELECT rowid FROM classifications_fts WHERE classifications_fts MATCH ?
+            )
+            ORDER BY c.confidence DESC
+            LIMIT ?
+            "#,
+        )
+        .bind(query)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let results = rows.into_iter().map(|(pubkey, name, picture, labels, bio, confidence, analyzed_at)| {
+            let parsed_labels: Vec<String> = serde_json::from_str(&labels).unwrap_or_default();
+            crate::http_server::RecentClassification {
+                pubkey,
+                name,
+                picture,
+                labels: parsed_labels,
+                bio,
+                confidence,
+                analyzed_at: analyzed_at.map(|t| t.to_rfc3339()),
+            }
+        }).collect();
+
+        Ok(results)
+    }
+}

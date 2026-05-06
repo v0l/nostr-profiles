@@ -1,0 +1,4 @@
+/target
+/nostr_classify.db
+/nostr_classify.db-journal
+.idea/
