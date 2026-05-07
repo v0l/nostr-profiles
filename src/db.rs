@@ -45,7 +45,6 @@ pub struct Profile {
     pub about: Option<String>,
     pub picture: Option<String>,
     pub is_classified: bool,
-    pub needs_processing: bool,
     pub follower_count: Option<i64>,
     pub metadata_json: Option<String>,
     pub metadata_created_at: Option<i64>,
@@ -114,248 +113,55 @@ impl Database {
         }
         
         let pool = SqlitePool::connect(path.to_str().unwrap()).await?;
-        Self::migrate(&pool).await?;
+        Self::run_migrations(&pool).await?;
         Ok(Self { pool })
     }
 
-    async fn migrate(pool: &SqlitePool) -> Result<()> {
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS profiles (
-                pubkey TEXT PRIMARY KEY,
-                nip05 TEXT,
-                name TEXT,
-                about TEXT,
-                picture TEXT,
-                is_classified BOOLEAN DEFAULT FALSE,
-                needs_processing BOOLEAN DEFAULT FALSE,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-            "#,
+    /// Run sqlx migrations. For legacy DBs (tables exist but no _sqlx_migrations table),
+    /// mark the init migration as already applied before running.
+    async fn run_migrations(pool: &SqlitePool) -> Result<()> {
+        let has_migration_table: bool = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='_sqlx_migrations'",
         )
-        .execute(pool)
-        .await?;
+        .fetch_one(pool)
+        .await?
+        > 0;
 
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS events (
-                id TEXT NOT NULL,
-                pubkey TEXT NOT NULL,
-                kind INTEGER NOT NULL,
-                created_at INTEGER NOT NULL,
-                raw_json TEXT NOT NULL,
-                PRIMARY KEY (id, pubkey)
-            )
-            "#,
-        )
-        .execute(pool)
-        .await?;
-
-        sqlx::query(
-            r#"
-            CREATE INDEX IF NOT EXISTS idx_events_pubkey_kind 
-            ON events(pubkey, kind, created_at)
-            "#,
-        )
-        .execute(pool)
-        .await?;
-
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS classifications (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                pubkey TEXT NOT NULL UNIQUE,
-                labels TEXT NOT NULL,
-                scores TEXT NOT NULL DEFAULT '{}',
-                bio TEXT NOT NULL,
-                confidence REAL,
-                analyzed_event_count INTEGER,
-                analyzed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (pubkey) REFERENCES profiles(pubkey)
-            )
-            "#,
-        )
-        .execute(pool)
-        .await?;
-
-        sqlx::query(
-            r#"
-            CREATE VIRTUAL TABLE IF NOT EXISTS classifications_fts USING fts5(
-                name,
-                about,
-                nip05,
-                labels,
-                scores,
-                bio,
-                pubkey UNINDEXED
-            )
-            "#,
-        )
-        .execute(pool)
-        .await?;
-
-        // Migrate: recreate FTS table if it uses the old schema
-        // Old schemas: (1) had 'pubkey' as indexed column, (2) used contentless fts5 (content=''),
-        // (3) missing 'scores' column
-        // FTS5 tables can't be ALTERed, so drop and rebuild
-        let needs_migration: bool = {
-            // Check for old 'pubkey' indexed column
-            let has_indexed_pubkey: bool = sqlx::query_scalar::<_, i64>(
-                r#"SELECT COUNT(*) FROM pragma_table_info('classifications_fts') WHERE name = 'pubkey'"#,
+        if !has_migration_table {
+            // Check if this is a legacy DB (has actual data tables but no migration tracking)
+            let has_profiles: bool = sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='profiles'",
             )
             .fetch_one(pool)
             .await?
             > 0;
 
-            // Check for missing 'scores' column
-            let has_scores: bool = sqlx::query_scalar::<_, i64>(
-                r#"SELECT COUNT(*) FROM pragma_table_info('classifications_fts') WHERE name = 'scores'"#,
-            )
-            .fetch_one(pool)
-            .await?
-            > 0;
+            if has_profiles {
+                // Legacy DB — schema was created by old manual migrations.
+                // Record the init migration as applied so sqlx::migrate skips it.
+                let migrator = sqlx::migrate!();
+                if let Some(init) = migrator.iter().find(|m| m.version == 20250101000000) {
+                    sqlx::query(
+                        "CREATE TABLE IF NOT EXISTS _sqlx_migrations (version BIGINT PRIMARY KEY, description TEXT NOT NULL, type INTEGER NOT NULL, checksum BLOB NOT NULL, installed_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, execution_time BIGINT NOT NULL, success BOOLEAN NOT NULL)"
+                    )
+                    .execute(pool)
+                    .await?;
 
-            has_indexed_pubkey || !has_scores
-        };
-
-        if needs_migration {
-            sqlx::query(r#"DROP TABLE classifications_fts"#)
-                .execute(pool)
-                .await?;
-            sqlx::query(
-                r#"
-                CREATE VIRTUAL TABLE classifications_fts USING fts5(
-                    name,
-                    about,
-                    nip05,
-                    labels,
-                    scores,
-                    bio,
-                    pubkey UNINDEXED
-                )
-                "#,
-            )
-            .execute(pool)
-            .await?;
-
-            // Rebuild FTS index from existing classified profiles
-            sqlx::query(
-                r#"
-                INSERT INTO classifications_fts (rowid, name, about, nip05, labels, scores, bio, pubkey)
-                SELECT c.id, p.name, p.about, p.nip05,
-                       REPLACE(REPLACE(SUBSTR(c.labels, 2, LENGTH(c.labels) - 2), '"', ''), ',', ' '),
-                       c.scores,
-                       c.bio, c.pubkey
-                FROM classifications c
-                JOIN profiles p ON c.pubkey = p.pubkey
-                "#,
-            )
-            .execute(pool)
-            .await?;
+                    sqlx::query(
+                        "INSERT INTO _sqlx_migrations (version, description, type, checksum, execution_time, success) VALUES (?, ?, ?, ?, 0, 1)"
+                    )
+                    .bind(init.version as i64)
+                    .bind(&init.description)
+                    .bind(init.migration_type as i64)
+                    .bind(init.checksum.as_ref() as &[u8])
+                    .execute(pool)
+                    .await?;
+                }
+            }
+            // Fresh DB: no tables, no migration table — just let sqlx::migrate run normally
         }
 
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS image_descriptions (
-                hash TEXT PRIMARY KEY,
-                description TEXT NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-            "#,
-        )
-        .execute(pool)
-        .await?;
-
-        // Migrate: add follower_count column if missing
-        let _ = sqlx::query(
-            r#"ALTER TABLE profiles ADD COLUMN follower_count INTEGER"#,
-        )
-        .execute(pool)
-        .await;
-
-        // Migrate: add scores column if missing
-        let _ = sqlx::query(
-            r#"ALTER TABLE classifications ADD COLUMN scores TEXT NOT NULL DEFAULT '{}'"#,
-        )
-        .execute(pool)
-        .await;
-
-        // Migrate: add metadata_json column if missing (stores raw kind 0 event for relay)
-        let _ = sqlx::query(
-            r#"ALTER TABLE profiles ADD COLUMN metadata_json TEXT"#,
-        )
-        .execute(pool)
-        .await;
-
-        // Migrate: add metadata_created_at column if missing (nostr event timestamp for kind 0)
-        let _ = sqlx::query(
-            r#"ALTER TABLE profiles ADD COLUMN metadata_created_at INTEGER"#,
-        )
-        .execute(pool)
-        .await;
-
-        // Migrate: events table composite PK (id, pubkey) to allow same event under multiple pubkeys
-        // (needed for zap receipts attributed to both LNURL server and sender)
-        let needs_events_migration: bool = {
-            // Check if PK is just 'id' (old) vs composite (new)
-            let pk_cols: Vec<String> = sqlx::query_as::<_, (String,)>(
-                r#"SELECT name FROM pragma_table_info('events') WHERE pk > 0 ORDER BY pk"#,
-            )
-            .fetch_all(pool)
-            .await
-            .map(|rows| rows.into_iter().map(|(n,)| n).collect())
-            .unwrap_or_default();
-
-            // Old schema: only 'id' is PK. New schema: both 'id' and 'pubkey' are PK.
-            !pk_cols.contains(&"pubkey".to_string())
-        };
-
-        if needs_events_migration {
-            tracing::info!("Migrating events table to composite primary key (id, pubkey)...");
-            sqlx::query(r#"CREATE TABLE events_new (
-                id TEXT NOT NULL,
-                pubkey TEXT NOT NULL,
-                kind INTEGER NOT NULL,
-                created_at INTEGER NOT NULL,
-                raw_json TEXT NOT NULL,
-                PRIMARY KEY (id, pubkey)
-            )"#)
-            .execute(pool)
-            .await?;
-
-            sqlx::query(r#"INSERT OR IGNORE INTO events_new SELECT * FROM events"#)
-                .execute(pool)
-                .await?;
-
-            sqlx::query(r#"DROP TABLE events"#)
-                .execute(pool)
-                .await?;
-
-            sqlx::query(r#"ALTER TABLE events_new RENAME TO events"#)
-                .execute(pool)
-                .await?;
-
-            sqlx::query(
-                r#"CREATE INDEX IF NOT EXISTS idx_events_pubkey_kind 
-                ON events(pubkey, kind, created_at)"#,
-            )
-            .execute(pool)
-            .await?;
-
-            tracing::info!("Events table migration complete");
-        }
-
-        // Simple key-value table for metadata like epoch
-        sqlx::query(
-            r#"CREATE TABLE IF NOT EXISTS kv (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            )"#,
-        )
-        .execute(pool)
-        .await?;
-
+        sqlx::migrate!().run(pool).await?;
         Ok(())
     }
 
@@ -390,7 +196,6 @@ impl Database {
         let result = sqlx::query(
             r#"UPDATE profiles SET
                 is_classified = FALSE,
-                needs_processing = TRUE,
                 updated_at = CURRENT_TIMESTAMP
                WHERE is_classified = TRUE"#,
         )
@@ -400,11 +205,36 @@ impl Database {
         Ok(result.rows_affected())
     }
 
+    /// Get pubkeys of profiles that need classification.
+    /// These are profiles with enough classifiable events (>= min_events) that aren't classified.
+    pub async fn get_unclassified_pubkeys(&self, min_events: i64) -> Result<Vec<String>> {
+        let kinds: Vec<i64> = CLASSIFIABLE_KINDS.iter().map(|k| *k as i64).collect();
+        let placeholders = kinds.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+
+        let sql = format!(
+            r#"SELECT p.pubkey FROM profiles p
+               INNER JOIN events e ON e.pubkey = p.pubkey AND e.kind IN ({})
+               WHERE p.is_classified = FALSE
+               GROUP BY p.pubkey
+               HAVING COUNT(*) >= ?"#,
+            placeholders
+        );
+
+        let mut query = sqlx::query_scalar::<_, String>(&sql);
+        for kind in &kinds {
+            query = query.bind(*kind);
+        }
+        query = query.bind(min_events);
+        let rows = query.fetch_all(&self.pool).await?;
+
+        Ok(rows)
+    }
+
     pub async fn upsert_profile(&self, pubkey: &str) -> Result<()> {
         sqlx::query(
             r#"
-            INSERT INTO profiles (pubkey, needs_processing)
-            VALUES (?, FALSE)
+            INSERT INTO profiles (pubkey)
+            VALUES (?)
             ON CONFLICT(pubkey) DO UPDATE SET
                 updated_at = CURRENT_TIMESTAMP
             "#,
@@ -431,7 +261,7 @@ impl Database {
 
             // Ensure profile exists
             sqlx::query(
-                r#"INSERT INTO profiles (pubkey, needs_processing) VALUES (?, FALSE)
+                r#"INSERT INTO profiles (pubkey) VALUES (?)
                    ON CONFLICT(pubkey) DO UPDATE SET updated_at = CURRENT_TIMESTAMP"#,
             )
             .bind(&pubkey)
@@ -507,7 +337,7 @@ impl Database {
                         if zap_request.verify().is_ok() {
                             let sender_pubkey = zap_request.pubkey.to_hex();
                             sqlx::query(
-                                r#"INSERT INTO profiles (pubkey, needs_processing) VALUES (?, FALSE)
+                                r#"INSERT INTO profiles (pubkey) VALUES (?)
                                    ON CONFLICT(pubkey) DO UPDATE SET updated_at = CURRENT_TIMESTAMP"#,
                             )
                             .bind(&sender_pubkey)
@@ -695,7 +525,7 @@ impl Database {
 
     pub async fn get_profile_details(&self, pubkey: &str) -> Result<Profile> {
         let profile = sqlx::query_as::<_, Profile>(
-            r#"SELECT pubkey, nip05, name, about, picture, is_classified, needs_processing, follower_count, metadata_json, created_at, updated_at FROM profiles WHERE pubkey = ?"#,
+            r#"SELECT pubkey, nip05, name, about, picture, is_classified, follower_count, metadata_json, created_at, updated_at FROM profiles WHERE pubkey = ?"#,
         )
         .bind(pubkey)
         .fetch_one(&self.pool)
@@ -738,7 +568,7 @@ impl Database {
 
     pub async fn get_profile_by_pubkey(&self, pubkey: &str) -> Result<Option<Profile>> {
         let profile = sqlx::query_as::<_, Profile>(
-            r#"SELECT pubkey, nip05, name, about, picture, is_classified, needs_processing, follower_count, metadata_json, metadata_created_at, created_at, updated_at FROM profiles WHERE pubkey = ?"#,
+            r#"SELECT pubkey, nip05, name, about, picture, is_classified, follower_count, metadata_json, metadata_created_at, created_at, updated_at FROM profiles WHERE pubkey = ?"#,
         )
         .bind(pubkey)
         .fetch_optional(&self.pool)
@@ -836,7 +666,6 @@ impl Database {
             r#"
             UPDATE profiles 
             SET is_classified = TRUE,
-                needs_processing = FALSE,
                 updated_at = CURRENT_TIMESTAMP
             WHERE pubkey = ?
             "#,

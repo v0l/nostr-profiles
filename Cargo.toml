@@ -11,7 +11,7 @@ axum = "0.8"
 base64 = "0.22.1"
 chrono = { version = "0.4.44", features = ["serde"] }
 config = "0.15.22"
-ffmpeg-rs-raw = { git = "https://github.com/v0l/ffmpeg-rs-raw.git" }
+ffmpeg-rs-raw = "1.0"
 futures = "0.3.32"
 hex = "0.4"
 hyper = "1"

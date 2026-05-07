@@ -2,6 +2,7 @@ mod classifier;
 mod config;
 mod count_cache;
 mod db;
+mod e2e_test;
 mod format;
 mod http_server;
 mod image_cache;
@@ -16,7 +17,7 @@ use crate::classifier::Classifier;
 use crate::config::Config;
 use crate::db::Database;
 use crate::image_cache::ImageCache;
-use crate::job_queue::JobQueue;
+use crate::job_queue::{JobQueue, Job};
 use crate::nostr_client::NostrClient;
 use crate::profile_cache::ProfileCache;
 use anyhow::Result;
@@ -26,7 +27,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 /// Classification epoch. Increment this when the system prompt, taxonomy,
 /// classification flow, or any other factor changes enough that all previously
 /// classified profiles should be re-processed.
-const CLASSIFICATION_EPOCH: u32 = 1;
+const CLASSIFICATION_EPOCH: u32 = 2;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -87,6 +88,21 @@ async fn main() -> Result<()> {
 
     let job_queue = Arc::new(JobQueue::new(config.processing.max_workers, config.processing.cache_days));
     tracing::info!("Job queue initialized with {} workers", config.processing.max_workers);
+
+    // Enqueue unclassified profiles on startup
+    {
+        let unclassified = db.get_unclassified_pubkeys(config.processing.event_threshold as i64).await?;
+        if !unclassified.is_empty() {
+            tracing::info!("Found {} unclassified profiles, enqueuing...", unclassified.len());
+            let mut queued = 0usize;
+            for pubkey in &unclassified {
+                if job_queue.enqueue(Job { pubkey: pubkey.clone() }).await? {
+                    queued += 1;
+                }
+            }
+            tracing::info!("Enqueued {} profiles for classification ({} already in queue)", queued, unclassified.len() - queued);
+        }
+    }
 
     // Build the search relay backed by our FTS index
     let relay = search_relay::SearchDatabase::build_relay(db.clone());

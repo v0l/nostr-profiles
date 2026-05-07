@@ -199,7 +199,7 @@ async fn process_job(
     Ok(())
 }
 
-fn build_context(
+pub fn build_context(
     profile: &Option<crate::db::Profile>,
     events: &[crate::db::Event],
     previous_classification: &Option<crate::db::Classification>,
@@ -251,9 +251,6 @@ mod tests {
 
     #[test]
     fn test_build_context_with_events() {
-        // Using a structurally valid but unsigned event — nostr_sdk rejects
-        // the signature, so the event is skipped. This still tests that
-        // build_context processes the events list without panicking.
         let events = vec![
             make_event(r#"{"id":"0000000000000000000000000000000000000000000000000000000000000000","pubkey":"0000000000000000000000000000000000000000000000000000000000000001","created_at":1000,"kind":1,"content":"Hello world","tags":[],"sig":"0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"}"#),
         ];

@@ -660,9 +660,9 @@ pub async fn describe_image(&self, path: &str) -> Result<String> {
             .collect::<Vec<_>>()
             .join("\n");
 
-        format!(r#"Analyze this Nostr profile activity and score it against a fixed label taxonomy.
+        format!(r#"Classify this person's interests based on their Nostr activity and score against a fixed label taxonomy.
 
-NIP-21 entities are how Nostr users reference other entities in their posts. They appear as `nostr:xxx` URIs in event content and embed rich context about what's being referenced. You MUST use the resolve_nip21 tool to look up any `nostr:` URI you see — you cannot determine what it contains from the URI alone.
+NIP-21 entities are how people reference other entities in their posts. They appear as `nostr:xxx` URIs in event content and embed rich context about what's being referenced. You MUST use the resolve_nip21 tool to look up any `nostr:` URI you see — you cannot determine what it contains from the URI alone.
 
 NIP-21 URI types:
 - nostr:npub1... — a public key (hex 32 bytes, bech32 encoded). Use resolve_nip21 to get their profile.
@@ -671,15 +671,15 @@ NIP-21 URI types:
 - nostr:nevent1... — an event ID with optional author, kind, and relay hints. Use resolve_nip21 to get the full event.
 - nostr:naddr1... — a coordinate reference (kind:pubkey:d-tag) for replaceable/parameterized events like long-form articles (kind 30023), channels, or communities. Use resolve_nip21 to get the referenced event.
 
-When you see a `nostr:` URI in event content, it means the user is explicitly referencing another entity — a person, a post, or a replaceable event. Call resolve_nip21 for each one to understand the context of what they're referencing.
+When you see a `nostr:` URI in event content, it means the person is explicitly referencing another entity — a person, a post, or a replaceable event. Call resolve_nip21 for each one to understand the context.
 
-Nostr event tags are how users reference other users and content at the protocol level. Understanding them is critical for classification:
+Nostr event tags are how people reference other people and content at the protocol level. Understanding them is critical for classification:
 
 - ["e", "<event_id>"] — references another event. Used in replies, reactions, and reposts.
-- ["e", "<event_id>", "<relay_url>", "<marker>", "<pubkey>"] — marked e tag. The marker is "root" (the event starting a thread) or "reply" (the direct parent being responded to). This tells you the user is replying in a conversation.
-- ["p", "<pubkey>"] — mentions or notifies another user. Frequent ["p", ...] tags to the same pubkey indicate a social connection or ongoing conversation.
+- ["e", "<event_id>", "<relay_url>", "<marker>", "<pubkey>"] — marked e tag. The marker is "root" (the event starting a thread) or "reply" (the direct parent being responded to). This indicates a reply in a conversation.
+- ["p", "<pubkey>"] — mentions or notifies another person. Frequent ["p", ...] tags to the same pubkey indicate a social connection or ongoing conversation.
 - ["a", "<kind>:<pubkey>:<d-tag>"] — references a replaceable or parameterized event by its coordinate. Common for referencing long-form articles (kind 30023), channels, or communities.
-- ["q", "<event_id>", "<relay_url>", "<pubkey>"] — quote repost. Unlike e tags (which are replies in a thread), q tags mean the user is quoting another event in their own post. This is NOT a reply — it's a citation. Used in kind 1 posts that reference other notes via nostr:nevent:... URIs.
+- ["q", "<event_id>", "<relay_url>", "<pubkey>"] — quote repost. Unlike e tags (which are replies in a thread), q tags mean the person is quoting another event in their own post. This is NOT a reply — it's a citation.
 - ["k", "<kind_number>"] — indicates the kind of the event being referenced (used in reactions kind 7, generic reposts kind 16, and external content reactions kind 17).
 
 Zap events (kind 9735 = zap receipt) are particularly rich signals:
@@ -695,18 +695,18 @@ Zap events (kind 9735 = zap receipt) are particularly rich signals:
   - The ["e", "..."] and ["p", "..."] tags from the request
 - The ["amount", "<millisats>"] tag may also appear directly on the 9735.
 
-When you see a 9735 event in a user's activity, parse the description tag to understand who sent the zap, how much, and what event or profile it was for. Zaps received indicate what content the user's audience values.
+When you see a 9735 event, parse the description tag to understand who sent the zap, how much, and what event or profile it was for. Zaps received indicate what content the person's audience values.
 
-When you see these tags, consider what the user is interacting with — replying to specific posts (e tags with "reply" marker), quoting content (q tags), mentioning people (p tags), or joining communities (a tags) all reveal interests and social connections.
+When you see these tags, consider what the person is interacting with — replying to specific posts (e tags with "reply" marker), quoting content (q tags), mentioning people (p tags), or joining communities (a tags) all reveal interests and social connections.
 
 Consider all available signals:
-- Posts: What topics does the user post about? What tone and expertise level do they show?
-- Replies (events with ["e", ...] tags): Who do they interact with? What topics do they engage with? What communities are they part of?
+- Posts: What topics are discussed? What tone and expertise level?
+- Replies (events with ["e", ...] tags): What topics come up in conversations? What communities?
 - Mentions (["p", ...] tags): Who do they talk to or about? Frequent mentions of the same pubkey suggest a close social connection.
-- Reactions: What content do they like/react to? This indicates their interests and agreements.
-- Reposts: What content do they amplify? This shows what they want to associate with.
-- Zaps received: What content earns them tips? This shows what their audience values.
-- Zaps sent: Who do they tip? This shows who they support.
+- Reactions: What content do they react to? Use get_event to look up the referenced event — this reveals their interests.
+- Reposts: What content do they amplify? This shows what they associate with.
+- Zaps received: What content earns tips? This shows what the audience values.
+- Zaps sent: Who do they tip? This shows who they support financially.
 - Profile picture and images: Call describe_image for any image URL you see (profile pictures, images in posts). You cannot judge visual content from a URL alone — always call describe_image first.
 - Profile metadata: Name, about section, NIP-05 domain, and picture can all signal identity and interests.
 
@@ -725,29 +725,28 @@ LABEL TAXONOMY (score each one):
 {label_list}
 
 Scoring rules:
-- Score each label 0.0–1.0 based on how well it fits the profile
-- 0.0 = not relevant at all, 1.0 = perfectly describes this profile
+- Score each label 0.0–1.0 based on how well it fits
+- 0.0 = not relevant at all, 1.0 = perfectly fits
 - Be selective: most labels should score 0.0 or close to it
-- A label should only score above {min_score} if there is clear evidence in the activity
+- A label should only score above {min_score} if there is clear evidence
 - Multiple related labels can score high (e.g. both "bitcoin" and "lightning-network")
 - Use image descriptions to inform labels like "artist", "photographer", "nsfw", "bot" etc.
-- Consider the depth of engagement: someone who occasionally mentions bitcoin is different from someone who posts about it daily
+- Reactions and reposts reveal interests just as much as original posts — someone who reacts to bitcoin content is interested in bitcoin
 
 Generate:
 1. scores: An object mapping each label name to its score (0.0–1.0). Include ALL labels, even those scoring 0.0.
-2. bio: A rich, detailed summary of this person based on their activity. Cover:
-    - Their primary interests and expertise areas
-    - Their role in communities (creator, commentator, builder, organizer, etc.)
-    - Notable patterns in their behavior or content
-    - Any distinctive characteristics that set them apart
-    Rules:
-    - Do NOT mention "Nostr user" or "Nostr power user" — being on Nostr is a given, not a distinguishing trait.
-    - Do NOT mention generic activity patterns like "frequently reacts", "actively engages", or "posts daily updates" — most users do these things. Instead, describe WHAT they react to and WHAT they post about.
-    - Focus on what makes this person unique: their topics, expertise, community roles, and the content they create or amplify.
+2. bio: A summary of who this person is and what they care about. Rules:
+   - Describe ONLY their interests and topics. Write about what they care about, not what they do for a living or how they behave online.
+   - Do NOT speculate about professional roles, expertise, or technical skill levels unless directly evidenced by their content. If someone reacts to a bitcoin post, they are interested in bitcoin — they are not necessarily a "bitcoin developer" or "expert".
+   - Do NOT describe HOW they use the platform — no "casual observer", "active participant", "engages with", "engagement style", "doesn't create content", "low-key", "supportive", "frequently reacts", "actively engages", or any similar phrasing. These are forbidden.
+   - Do NOT mention Nostr at all — no "Nostr user", "Nostr community", "active on Nostr", etc.
+   - Bad: "Alice is a casual observer who reacts to bitcoin posts and doesn't create much content. While not a developer herself..."
+   - Good: "Alice is interested in Bitcoin and the Lightning Network, with an appreciation for nature and quiet mornings."
 3. confidence: 0.0-1.0 indicating how confident you are in the overall classification
 
 Output ONLY valid JSON with this exact structure:
 {{"scores": {{"label-name": 0.8, ...}}, "bio": "summary text", "confidence": 0.85}}"#,
+
             label_list = label_list,
             min_score = self.label_min_score,
         )
