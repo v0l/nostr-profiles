@@ -1,14 +1,51 @@
-FROM rust:trixie AS builder
-WORKDIR /usr/src/app
-COPY Cargo.toml Cargo.lock dashboard.html ./
-COPY src/ src/
-RUN cargo build --release
+# ── Rust dependency cache ─────────────────────────────────────────────────────
+FROM voidic/rust-ffmpeg AS rust-deps
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+RUN mkdir -p src && echo "fn main() {}" > src/main.rs
+RUN cargo build --release && \
+    rm -f target/release/nostr-classify \
+          target/release/deps/nostr-classify-* \
+          target/release/deps/libnostr_classify-*
 
+# ── Rust application build ────────────────────────────────────────────────────
+FROM rust-deps AS rust-build
+COPY src ./src
+COPY dashboard.html ./
+RUN touch src/main.rs
+RUN cargo build --release && \
+    mkdir -p /app/bin && \
+    cp target/release/nostr-classify /app/bin/nostr-classify
+
+# ── Runtime image ─────────────────────────────────────────────────────────────
 FROM debian:trixie-slim
-RUN apt-get update && apt-get install -y \
-    ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
-COPY --from=builder /usr/src/app/target/release/nostr-classify /usr/local/bin/nostr-classify
 WORKDIR /app
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        ca-certificates \
+        libssl3 \
+        libx264-164 \
+        libx265-215 \
+        libvpx9 \
+        libopus0 \
+        libwebp7 \
+        libwebpmux3 \
+        libdav1d7 \
+        va-driver-all \
+        libva-drm2 \
+        libva-x11-2 \
+        libva-wayland2 \
+        libva-glx2 && \
+    if [ "$(dpkg --print-architecture)" = "amd64" ]; then \
+        apt-get install -y --no-install-recommends libvpl2; \
+    fi && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY --from=rust-build /app/bin       ./bin
+COPY --from=rust-build /src/ffmpeg/lib/ /lib
+
+ENV RUST_BACKTRACE=1
+
 EXPOSE 3000
-CMD ["nostr-classify"]
+CMD ["./bin/nostr-classify"]
