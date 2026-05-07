@@ -89,6 +89,25 @@ async fn main() -> Result<()> {
     let job_queue = Arc::new(JobQueue::new(config.processing.max_workers, config.processing.cache_days));
     tracing::info!("Job queue initialized with {} workers", config.processing.max_workers);
 
+    // Build the search relay backed by our FTS index
+    let relay = search_relay::SearchDatabase::build_relay(db.clone());
+
+    // Start HTTP server with the search relay on the same port
+    let db_clone = Arc::clone(&db);
+    let server_handle = tokio::spawn(async move {
+        http_server::serve(db_clone, relay, 3000).await;
+    });
+
+    // Start job queue workers BEFORE enqueuing — otherwise the channel fills
+    // up and enqueue blocks forever with no consumers
+    let job_queue_clone = Arc::clone(&job_queue);
+    let db_clone = Arc::clone(&db);
+    let classifier_clone = classifier.clone();
+    let image_cache_clone = image_cache.clone();
+    let processor_handle = tokio::spawn(async move {
+        job_queue_clone.run(db_clone, classifier_clone, image_cache_clone).await;
+    });
+
     // Enqueue unclassified profiles on startup
     {
         let unclassified = db.get_unclassified_pubkeys(config.processing.event_threshold as i64).await?;
@@ -103,23 +122,6 @@ async fn main() -> Result<()> {
             tracing::info!("Enqueued {} profiles for classification ({} already in queue)", queued, unclassified.len() - queued);
         }
     }
-
-    // Build the search relay backed by our FTS index
-    let relay = search_relay::SearchDatabase::build_relay(db.clone());
-
-    // Start HTTP server with the search relay on the same port
-    let db_clone = Arc::clone(&db);
-    let server_handle = tokio::spawn(async move {
-        http_server::serve(db_clone, relay, 3000).await;
-    });
-
-    let job_queue_clone = Arc::clone(&job_queue);
-    let db_clone = Arc::clone(&db);
-    let classifier_clone = classifier.clone();
-    let image_cache_clone = image_cache.clone();
-    let processor_handle = tokio::spawn(async move {
-        job_queue_clone.run(db_clone, classifier_clone, image_cache_clone).await;
-    });
 
     let collector = crate::nostr_collector::NostrCollector;
     let collector_handle = tokio::spawn(async move {
