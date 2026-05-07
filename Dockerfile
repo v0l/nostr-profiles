@@ -43,7 +43,7 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 COPY --from=rust-build /app/bin       ./bin
-COPY --from=rust-build /src/ffmpeg/lib/ /lib
+COPY --from=rust-build /app/src/ffmpeg/lib/ /lib
 
 ENV RUST_BACKTRACE=1
 
