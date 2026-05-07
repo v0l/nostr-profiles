@@ -152,6 +152,23 @@ impl Classifier {
                     strict: None,
                 },
             }),
+            ChatCompletionTools::Function(ChatCompletionTool {
+                function: FunctionObject {
+                    name: "resolve_nip21".to_string(),
+                    description: Some("Resolve a NIP-21 nostr: URI to get details about the referenced entity. Accepts nostr:npub1..., nostr:nprofile1..., nostr:note1..., nostr:nevent1..., and nostr:naddr1... URIs. For profile references (npub/nprofile), returns profile metadata. For event references (note/nevent/naddr), returns the full event including content and tags. ALWAYS call this for any nostr: URI you encounter in event content — you cannot determine what it references from the URI alone.".to_string()),
+                    parameters: Some(serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "uri": {
+                                "type": "string",
+                                "description": "The NIP-21 URI to resolve (e.g. nostr:npub1..., nostr:nevent1..., nostr:naddr1...)"
+                            }
+                        },
+                        "required": ["uri"]
+                    })),
+                    strict: None,
+                },
+            }),
         ]);
 
         let request = CreateChatCompletionRequest {
@@ -473,6 +490,98 @@ impl Classifier {
                     None => Ok(format!("Could not download image: {}", url)),
                 }
             }
+            "resolve_nip21" => {
+                let args: serde_json::Value = serde_json::from_str(arguments)
+                    .map_err(|e| anyhow::anyhow!("Invalid JSON arguments: {}", e))?;
+                let uri = args.get("uri")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow::anyhow!("Missing uri"))?;
+
+                match nostr_sdk::nips::nip21::Nip21::parse(uri) {
+                    Ok(nip21) => match nip21 {
+                        nostr_sdk::nips::nip21::Nip21::Pubkey(pk) => {
+                            let pubkey_hex = pk.to_hex();
+                            match self.profile_cache.get_profile(&pubkey_hex).await? {
+                                Some(profile) => Ok(crate::format::describe_profile(&profile)),
+                                None => Ok(format!("Profile not found: {}", pubkey_hex)),
+                            }
+                        }
+                        nostr_sdk::nips::nip21::Nip21::Profile(nprofile) => {
+                            let pubkey_hex = nprofile.public_key.to_hex();
+                            match self.profile_cache.get_profile(&pubkey_hex).await? {
+                                Some(profile) => Ok(crate::format::describe_profile(&profile)),
+                                None => Ok(format!("Profile not found: {}", pubkey_hex)),
+                            }
+                        }
+                        nostr_sdk::nips::nip21::Nip21::EventId(event_id) => {
+                            let event_id_hex = event_id.to_hex();
+                            // Check DB cache first
+                            if let Some(cached) = self.db.get_event(&event_id_hex).await? {
+                                if let Ok(event) = nostr_sdk::Event::from_json(&cached.raw_json) {
+                                    return Ok(crate::format::describe_event(&event));
+                                }
+                            }
+                            // Fetch from relays
+                            match self.nostr.fetch_event_by_id(&event_id_hex).await? {
+                                Some(event) => {
+                                    if let Err(e) = self.db.cache_event(&event).await {
+                                        tracing::warn!("Failed to cache fetched event {}: {}", event_id_hex, e);
+                                    }
+                                    Ok(crate::format::describe_event(&event))
+                                }
+                                None => Ok(format!("Event not found: {}", event_id_hex)),
+                            }
+                        }
+                        nostr_sdk::nips::nip21::Nip21::Event(nevent) => {
+                            let event_id_hex = nevent.event_id.to_hex();
+                            // Check DB cache first
+                            if let Some(cached) = self.db.get_event(&event_id_hex).await? {
+                                if let Ok(event) = nostr_sdk::Event::from_json(&cached.raw_json) {
+                                    return Ok(crate::format::describe_event(&event));
+                                }
+                            }
+                            // Fetch from relays
+                            match self.nostr.fetch_event_by_id(&event_id_hex).await? {
+                                Some(event) => {
+                                    if let Err(e) = self.db.cache_event(&event).await {
+                                        tracing::warn!("Failed to cache fetched event {}: {}", event_id_hex, e);
+                                    }
+                                    Ok(crate::format::describe_event(&event))
+                                }
+                                None => Ok(format!("Event not found: {}", event_id_hex)),
+                            }
+                        }
+                        nostr_sdk::nips::nip21::Nip21::Coordinate(naddr) => {
+                            // For naddr, we need to fetch by coordinate (kind:pubkey:dtag)
+                            // Build a filter for the addressable event
+                            let coord = &naddr.coordinate;
+                            let filter = nostr_sdk::Filter::new()
+                                .kind(coord.kind)
+                                .author(coord.public_key)
+                                .identifier(&coord.identifier)
+                                .limit(1);
+
+                            match self.nostr.client()
+                                .fetch_events(filter, std::time::Duration::from_secs(10))
+                                .await
+                            {
+                                Ok(events) => {
+                                    if let Some(event) = events.into_iter().next() {
+                                        if let Err(e) = self.db.cache_event(&event).await {
+                                            tracing::warn!("Failed to cache fetched coordinate event: {}", e);
+                                        }
+                                        Ok(crate::format::describe_event(&event))
+                                    } else {
+                                        Ok(format!("Addressable event not found: {}:{}", coord.kind, coord.public_key.to_hex()))
+                                    }
+                                }
+                                Err(e) => Ok(format!("Error fetching addressable event: {}", e)),
+                            }
+                        }
+                    },
+                    Err(e) => Ok(format!("Invalid NIP-21 URI '{}': {}", uri, e)),
+                }
+            }
             _ => Err(anyhow::anyhow!("Unknown tool: {}", name)),
         }
     }
@@ -545,7 +654,18 @@ impl Classifier {
 
         format!(r#"Analyze this Nostr profile activity and score it against a fixed label taxonomy.
 
-Nostr event tags are how users reference other users and content. Understanding them is critical for classification:
+NIP-21 entities are how Nostr users reference other entities in their posts. They appear as `nostr:xxx` URIs in event content and embed rich context about what's being referenced. You MUST use the resolve_nip21 tool to look up any `nostr:` URI you see — you cannot determine what it contains from the URI alone.
+
+NIP-21 URI types:
+- nostr:npub1... — a public key (hex 32 bytes, bech32 encoded). Use resolve_nip21 to get their profile.
+- nostr:nprofile1... — a public key with relay hints. Use resolve_nip21 to get their profile.
+- nostr:note1... — an event ID (hex 32 bytes, bech32 encoded). Use resolve_nip21 to get the full event.
+- nostr:nevent1... — an event ID with optional author, kind, and relay hints. Use resolve_nip21 to get the full event.
+- nostr:naddr1... — a coordinate reference (kind:pubkey:d-tag) for replaceable/parameterized events like long-form articles (kind 30023), channels, or communities. Use resolve_nip21 to get the referenced event.
+
+When you see a `nostr:` URI in event content, it means the user is explicitly referencing another entity — a person, a post, or a replaceable event. Call resolve_nip21 for each one to understand the context of what they're referencing.
+
+Nostr event tags are how users reference other users and content at the protocol level. Understanding them is critical for classification:
 
 - ["e", "<event_id>"] — references another event. Used in replies, reactions, and reposts.
 - ["e", "<event_id>", "<relay_url>", "<marker>", "<pubkey>"] — marked e tag. The marker is "root" (the event starting a thread) or "reply" (the direct parent being responded to). This tells you the user is replying in a conversation.
@@ -584,10 +704,14 @@ Consider all available signals:
 
 If a PREVIOUS CLASSIFICATION section is present, use it as context — adjust scores based on new activity.
 
-IMPORTANT: Before scoring, call describe_image for every image URL in the profile data. This includes:
-- "Profile Image: https://..." lines
-- Any URLs ending in .jpg, .jpeg, .png, .gif, .webp in event content
-You MUST call describe_image for these URLs — do not skip them or guess what they contain.
+IMPORTANT: Before scoring, call the appropriate tools for every reference you encounter:
+1. Call describe_image for every image URL in the profile data. This includes:
+   - "Profile Image: https://..." lines
+   - Any URLs ending in .jpg, .jpeg, .png, .gif, .webp in event content
+   You MUST call describe_image for these URLs — do not skip them or guess what they contain.
+2. Call resolve_nip21 for every nostr: URI in event content (e.g. nostr:npub1..., nostr:nevent1..., nostr:naddr1...).
+   These are explicit references to other entities — understanding what they point to is critical for classification.
+   Do NOT skip them or guess what they reference from the URI string alone.
 
 LABEL TAXONOMY (score each one):
 {label_list}
