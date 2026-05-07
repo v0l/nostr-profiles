@@ -33,7 +33,7 @@ impl Clone for JobQueue {
 
 impl JobQueue {
     pub fn new(max_workers: usize, cache_days: u64) -> Self {
-        let (tx, rx) = mpsc::channel(100);
+        let (tx, rx) = mpsc::channel(10000);
 
         Self {
             tx,
