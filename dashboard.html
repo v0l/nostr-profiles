@@ -234,6 +234,96 @@
             padding: 40px;
             color: #666;
         }
+        .stats-row {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 24px;
+        }
+        .stat-card {
+            flex: 1;
+            background: #2a2a2a;
+            border: 1px solid #3a3a3a;
+            border-radius: 10px;
+            padding: 14px 16px;
+            text-align: center;
+        }
+        .stat-value {
+            font-size: 28px;
+            font-weight: 700;
+            color: #fff;
+            line-height: 1.2;
+        }
+        .stat-label {
+            font-size: 11px;
+            color: #888;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-top: 4px;
+        }
+        .stat-value.green { color: #66bb6a; }
+        .stat-value.blue { color: #64b5f6; }
+        .stat-value.orange { color: #ffa726; }
+        .label-stats {
+            background: #2a2a2a;
+            border: 1px solid #3a3a3a;
+            border-radius: 10px;
+            padding: 16px 20px;
+            margin-bottom: 24px;
+        }
+        .label-stats h3 {
+            color: #fff;
+            font-size: 14px;
+            margin-bottom: 12px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+        .label-bar-row {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-bottom: 6px;
+        }
+        .label-bar-name {
+            width: 120px;
+            font-size: 12px;
+            color: #ccc;
+            text-align: right;
+            flex-shrink: 0;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .label-bar-track {
+            flex: 1;
+            height: 18px;
+            background: #3a3a3a;
+            border-radius: 4px;
+            overflow: hidden;
+            position: relative;
+        }
+        .label-bar-fill {
+            height: 100%;
+            border-radius: 4px;
+            transition: width 0.4s;
+        }
+        .label-bar-count {
+            width: 50px;
+            font-size: 11px;
+            color: #888;
+            flex-shrink: 0;
+        }
+        .labels-toggle {
+            font-size: 12px;
+            color: #64b5f6;
+            cursor: pointer;
+            background: none;
+            border: none;
+            padding: 6px 0;
+            text-align: left;
+        }
+        .labels-toggle:hover {
+            color: #42a5f5;
+        }
     </style>
 
     <script type="importmap">
@@ -351,12 +441,70 @@
             `;
         }
 
+        function StatsBar({ stats }) {
+            if (!stats) return null;
+            return html`
+                <div class="stats-row">
+                    <div class="stat-card">
+                        <div class="stat-value">${stats.total_profiles.toLocaleString()}</div>
+                        <div class="stat-label">Profiles</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-value green">${stats.classified_profiles.toLocaleString()}</div>
+                        <div class="stat-label">Classified</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-value orange">${stats.queue_size.toLocaleString()}</div>
+                        <div class="stat-label">Queue</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-value blue">${stats.labels.total_unique_labels.toLocaleString()}</div>
+                        <div class="stat-label">Labels</div>
+                    </div>
+                </div>
+            `;
+        }
+
+        function LabelStatsPanel({ stats }) {
+            const [expanded, setExpanded] = useState(false);
+            if (!stats || !stats.labels || stats.labels.label_counts.length === 0) return null;
+
+            const maxCount = stats.labels.label_counts[0]?.count || 1;
+            const showCount = expanded ? stats.labels.label_counts.length : 10;
+            const visible = stats.labels.label_counts.slice(0, showCount);
+            const hasMore = stats.labels.label_counts.length > 10;
+
+            return html`
+                <div class="label-stats">
+                    <h3>Top Labels</h3>
+                    ${visible.map(({ label, count }) => html`
+                        <div class="label-bar-row" key=${label}>
+                            <span class="label-bar-name">${label}</span>
+                            <div class="label-bar-track">
+                                <div class="label-bar-fill" style=${{
+                                    width: (count / maxCount * 100) + '%',
+                                    background: '#64b5f6'
+                                }} />
+                            </div>
+                            <span class="label-bar-count">${count}</span>
+                        </div>
+                    `)}
+                    ${hasMore && html`
+                        <button class="labels-toggle" onClick=${() => setExpanded(!expanded)}>
+                            ${expanded ? 'Show less' : `Show all ${stats.labels.label_counts.length} labels`}
+                        </button>
+                    `}
+                </div>
+            `;
+        }
+
         function App() {
             const [pubkey, setPubkey] = useState('');
             const [loading, setLoading] = useState(false);
             const [error, setError] = useState(null);
             const [profile, setProfile] = useState(null);
             const [recent, setRecent] = useState([]);
+            const [stats, setStats] = useState(null);
 
             const searchProfile = useCallback(async (pk) => {
                 const key = (pk || pubkey).trim();
@@ -398,6 +546,10 @@
                     .then(r => r.json())
                     .then(setRecent)
                     .catch(() => {});
+                const loadStats = () => fetch('/api/stats').then(r => r.json()).then(setStats).catch(() => {});
+                loadStats();
+                const iv = setInterval(loadStats, 10000);
+                return () => clearInterval(iv);
             }, []);
 
             useEffect(() => {
@@ -415,6 +567,9 @@
             return html`
                 <div class="app">
                     <h1>Nostr Profile Classifier</h1>
+
+                    <${StatsBar} stats=${stats} />
+                    <${LabelStatsPanel} stats=${stats} />
 
                     <div class="search-box">
                         <input type="text"

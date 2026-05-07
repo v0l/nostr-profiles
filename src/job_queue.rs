@@ -62,6 +62,10 @@ impl JobQueue {
         Ok(true)
     }
 
+    pub async fn queue_len(&self) -> usize {
+        self.queued_pubkeys.lock().await.len()
+    }
+
     pub async fn dequeue(&self, pubkey: &str) {
         // Remove from tracking when job is processed
         let mut queued = self.queued_pubkeys.lock().await;

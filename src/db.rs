@@ -880,6 +880,31 @@ impl Database {
         Ok(results)
     }
 
+    /// Get all stats in a single query.
+    /// Returns (total_profiles, classified_profiles, total_unique_labels, label_counts).
+    pub async fn get_stats(&self) -> Result<(i64, i64, i64, Vec<(String, i64)>)> {
+        let (total_profiles, classified_profiles, total_unique_labels): (i64, i64, i64) =
+            sqlx::query_as(
+                r#"SELECT
+                    (SELECT COUNT(*) FROM profiles),
+                    (SELECT COUNT(*) FROM profiles WHERE is_classified = TRUE),
+                    (SELECT COUNT(DISTINCT value) FROM classifications, json_each(labels))"#,
+            )
+            .fetch_one(&self.pool)
+            .await?;
+
+        let label_counts = sqlx::query_as::<_, (String, i64)>(
+            r#"SELECT value AS label, COUNT(*) AS count
+               FROM classifications, json_each(labels)
+               GROUP BY value
+               ORDER BY count DESC"#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok((total_profiles, classified_profiles, total_unique_labels, label_counts))
+    }
+
     /// Prepare a user query for FTS5: add prefix wildcard to each term.
     /// Handles FTS5 special characters by stripping them.
     /// e.g. "bitcoin rust" → "bitcoin* rust*"

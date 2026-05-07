@@ -1,4 +1,5 @@
 use crate::db::Database;
+use crate::job_queue::JobQueue;
 use axum::{
     extract::{Request, State},
     http::{header, StatusCode},
@@ -13,11 +14,12 @@ use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
 use std::sync::Arc;
 
-/// Shared application state: the database and the search relay.
+/// Shared application state: the database, the search relay, and the job queue.
 #[derive(Clone)]
 pub struct AppState {
     pub db: Arc<Database>,
     pub relay: LocalRelay,
+    pub job_queue: Arc<JobQueue>,
 }
 
 #[derive(Serialize)]
@@ -39,6 +41,26 @@ struct ClassificationResponse {
     bio: String,
     confidence: f64,
     analyzed_at: Option<String>,
+}
+
+#[derive(Serialize)]
+struct StatsResponse {
+    total_profiles: i64,
+    classified_profiles: i64,
+    queue_size: usize,
+    labels: LabelStats,
+}
+
+#[derive(Serialize)]
+struct LabelStats {
+    total_unique_labels: i64,
+    label_counts: Vec<LabelCount>,
+}
+
+#[derive(Serialize)]
+struct LabelCount {
+    label: String,
+    count: i64,
 }
 
 #[derive(Serialize)]
@@ -64,14 +86,15 @@ struct SearchQuery {
     limit: Option<i64>,
 }
 
-pub async fn serve(db: Arc<Database>, relay: LocalRelay, port: u16) {
-    let state = AppState { db, relay };
+pub async fn serve(db: Arc<Database>, relay: LocalRelay, job_queue: Arc<JobQueue>, port: u16) {
+    let state = AppState { db, relay, job_queue };
 
     let app = Router::new()
         .route("/", get(root_handler))
         .route("/api/profile/{pubkey}", get(get_profile))
         .route("/api/recent", get(get_recent))
         .route("/api/search", get(search))
+        .route("/api/stats", get(get_stats))
         .with_state(state);
 
     let addr = format!("0.0.0.0:{}", port);
@@ -186,6 +209,27 @@ async fn search(
         Ok(results) => Json(results).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("Error: {}", e)).into_response(),
     }
+}
+
+async fn get_stats(State(state): State<AppState>) -> impl IntoResponse {
+    let (total_profiles, classified_profiles, total_unique_labels, label_counts) =
+        state.db.get_stats().await.unwrap_or((0, 0, 0, Vec::new()));
+    let queue_size = state.job_queue.queue_len().await;
+
+    let stats = StatsResponse {
+        total_profiles,
+        classified_profiles,
+        queue_size,
+        labels: LabelStats {
+            total_unique_labels,
+            label_counts: label_counts
+                .into_iter()
+                .map(|(label, count)| LabelCount { label, count })
+                .collect(),
+        },
+    };
+
+    Json(stats).into_response()
 }
 
 /// WebSocket upgrade handler for the nostr search relay.
