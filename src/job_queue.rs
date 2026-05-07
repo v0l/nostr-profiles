@@ -4,6 +4,7 @@ use crate::image_cache::ImageCache;
 use anyhow::Result;
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{mpsc, Mutex};
 
 #[derive(Debug, Clone)]
@@ -17,6 +18,7 @@ pub struct JobQueue {
     max_workers: usize,
     queued_pubkeys: Arc<Mutex<HashSet<String>>>,
     cache_days: u64,
+    job_timeout: Duration,
 }
 
 impl Clone for JobQueue {
@@ -27,12 +29,13 @@ impl Clone for JobQueue {
             max_workers: self.max_workers,
             queued_pubkeys: self.queued_pubkeys.clone(),
             cache_days: self.cache_days,
+            job_timeout: self.job_timeout,
         }
     }
 }
 
 impl JobQueue {
-    pub fn new(max_workers: usize, cache_days: u64) -> Self {
+    pub fn new(max_workers: usize, cache_days: u64, job_timeout: Duration) -> Self {
         let (tx, rx) = mpsc::channel(10000);
 
         Self {
@@ -41,6 +44,7 @@ impl JobQueue {
             max_workers,
             queued_pubkeys: Arc::new(Mutex::new(HashSet::new())),
             cache_days,
+            job_timeout,
         }
     }
 
@@ -75,6 +79,7 @@ impl JobQueue {
             let image_cache = image_cache.clone();
             let queue = queue_clone.clone();
             let cache_days = self.cache_days;
+            let job_timeout = self.job_timeout;
 
             let worker = tokio::spawn(async move {
                 loop {
@@ -89,7 +94,14 @@ impl JobQueue {
                     };
 
                     let pubkey = job.pubkey.clone();
-                    match process_job(&job, &db, &classifier, &image_cache, cache_days).await {
+                    let result = tokio::time::timeout(
+                        job_timeout,
+                        process_job(&job, &db, &classifier, &image_cache, cache_days),
+                    )
+                    .await
+                    .map_err(|_| anyhow::anyhow!("Job for profile {} timed out after {}s", pubkey, job_timeout.as_secs()))
+                    .and_then(|r| r);
+                    match result {
                         Ok(_) => {
                             tracing::info!(
                                 "Worker {} successfully processed profile {}",
@@ -124,6 +136,7 @@ impl JobQueue {
             max_workers: self.max_workers,
             queued_pubkeys: self.queued_pubkeys.clone(),
             cache_days: self.cache_days,
+            job_timeout: self.job_timeout,
         }
     }
 }

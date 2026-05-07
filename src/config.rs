@@ -37,6 +37,10 @@ pub struct ProcessingConfig {
     pub max_retries: u8,
     pub image_download_timeout_secs: u64,
     pub min_followers: usize,
+    /// Timeout in seconds for a single classification job (profile fetch + classify + save) (default: 600)
+    pub job_timeout_secs: u64,
+    /// Timeout in seconds for individual LLM tool calls (get_event, get_profile, etc.) (default: 30)
+    pub tool_call_timeout_secs: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -69,6 +73,8 @@ impl Config {
             .set_default("llm.timeout_secs", 120)?
             .set_default("llm.classify_timeout_secs", 300)?
             .set_default("processing.min_followers", 1)?
+            .set_default("processing.job_timeout_secs", 600)?
+            .set_default("processing.tool_call_timeout_secs", 30)?
             .set_default("labels.min_score", 0.4)?
             .add_source(config::File::from(path.as_ref()))
             .build()?;

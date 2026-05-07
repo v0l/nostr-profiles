@@ -79,6 +79,7 @@ async fn main() -> Result<()> {
         db.clone(),
         crate::config::load_label_taxonomy(config.labels.taxonomy_file.as_deref()),
         config.labels.min_score,
+        std::time::Duration::from_secs(config.processing.tool_call_timeout_secs),
     );
     tracing::info!("Classifier initialized with model {} and {} labels (min_score={})",
         config.llm.model,
@@ -86,7 +87,7 @@ async fn main() -> Result<()> {
         config.labels.min_score
     );
 
-    let job_queue = Arc::new(JobQueue::new(config.processing.max_workers, config.processing.cache_days));
+    let job_queue = Arc::new(JobQueue::new(config.processing.max_workers, config.processing.cache_days, std::time::Duration::from_secs(config.processing.job_timeout_secs)));
     tracing::info!("Job queue initialized with {} workers", config.processing.max_workers);
 
     // Build the search relay backed by our FTS index

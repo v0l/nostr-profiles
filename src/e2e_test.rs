@@ -127,6 +127,7 @@ async fn e2e_classify_reaction_infers_interest() -> Result<()> {
         nostr, profile_cache, image_cache, db,
         crate::config::load_label_taxonomy(config.labels.taxonomy_file.as_deref()),
         config.labels.min_score,
+        std::time::Duration::from_secs(config.processing.tool_call_timeout_secs),
     );
 
     let result = classifier.classify(&context).await?;

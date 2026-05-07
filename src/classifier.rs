@@ -47,6 +47,7 @@ pub struct Classifier {
     label_taxonomy: Vec<String>,
     label_min_score: f64,
     classify_timeout: Duration,
+    tool_call_timeout: Duration,
 }
 
 impl Classifier {
@@ -54,7 +55,7 @@ impl Classifier {
         &self.profile_cache
     }
 
-    pub fn new(config: &LlmConfig, nostr: NostrClient, profile_cache: ProfileCache, image_cache: ImageCache, db: Arc<Database>, label_taxonomy: Vec<String>, label_min_score: f64) -> Self {
+    pub fn new(config: &LlmConfig, nostr: NostrClient, profile_cache: ProfileCache, image_cache: ImageCache, db: Arc<Database>, label_taxonomy: Vec<String>, label_min_score: f64, tool_call_timeout: Duration) -> Self {
         let openai_config = OpenAIConfig::new()
             .with_api_base(&config.api_base_url)
             .with_api_key(&config.api_key);
@@ -79,6 +80,7 @@ impl Classifier {
             label_taxonomy,
             label_min_score,
             classify_timeout,
+            tool_call_timeout,
         }
     }
 
@@ -273,7 +275,13 @@ impl Classifier {
                         }
                     };
                     info!("Tool call: {}({})", name, arguments);
-                    let result = self.call_tool(&name, &arguments).await?;
+                    let result = tokio::time::timeout(
+                        self.tool_call_timeout,
+                        self.call_tool(&name, &arguments),
+                    )
+                    .await
+                    .map_err(|_| anyhow::anyhow!("Tool call '{}' timed out after {}s", name, self.tool_call_timeout.as_secs()))?
+                    .map_err(|e| anyhow::anyhow!("Tool call '{}' failed: {}", name, e))?;
                     info!("Tool response: {} -> {:.200}", name, result);
                     
                     // Add tool response message
