@@ -96,22 +96,22 @@ impl NostrCollector {
         event_counts: &EventCountCache,
         follower_cache: &FollowerCache,
     ) {
-        // 1. Batch-write events to DB
-        if let Err(e) = db.cache_events_batch(events).await {
-            tracing::error!("Failed to cache event batch: {}", e);
-            // Fall through — we still try to process what we can
-        }
+        // 1. Batch-write events to DB, get net new count per pubkey
+        let net_new = match db.cache_events_batch(events).await {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::error!("Failed to cache event batch: {}", e);
+                return;
+            }
+        };
 
-        // 2. Count new events per pubkey from this batch
-        let mut new_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-        for event in events {
-            *new_counts.entry(event.pubkey.to_hex()).or_insert(0) += 1;
-        }
-
-        // 3. Update in-memory counts and collect pubkeys that cross the threshold
+        // 2. Update in-memory counts and collect pubkeys that cross the threshold
         let mut to_check: Vec<(String, usize)> = Vec::new();
-        for (pubkey, added) in &new_counts {
-            let total = event_counts.increment(pubkey, *added).await;
+        for (pubkey, added) in &net_new {
+            if *added == 0 {
+                continue; // replaceable event that updated an existing row — no net change
+            }
+            let total = event_counts.increment(pubkey, *added as usize).await;
             to_check.push((pubkey.clone(), total));
         }
 

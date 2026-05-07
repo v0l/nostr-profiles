@@ -29,15 +29,16 @@ struct ProfileResponse {
     nip05: Option<String>,
     event_count: usize,
     is_classified: bool,
+    metadata_json: Option<String>,
     classification: Option<ClassificationResponse>,
 }
 
 #[derive(Serialize)]
 struct ClassificationResponse {
-    labels: Vec<String>,
     scores: std::collections::HashMap<String, f64>,
     bio: String,
     confidence: f64,
+    analyzed_at: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -45,11 +46,11 @@ pub struct RecentClassification {
     pub pubkey: String,
     pub name: Option<String>,
     pub picture: Option<String>,
-    pub labels: Vec<String>,
     pub scores: std::collections::HashMap<String, f64>,
     pub bio: String,
     pub confidence: f64,
     pub analyzed_at: Option<String>,
+    pub metadata_json: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -132,17 +133,28 @@ async fn get_profile(
         nip05: profile.nip05,
         event_count,
         is_classified: profile.is_classified,
+        metadata_json: profile.metadata_json,
         classification: None,
     };
 
     // Get classification if exists
     if profile.is_classified {
         if let Ok(classification) = db.get_classification(&pubkey).await {
+            let analyzed_at = sqlx::query_scalar::<_, Option<chrono::DateTime<chrono::Utc>>>(
+                r#"SELECT analyzed_at FROM classifications WHERE pubkey = ?"#,
+            )
+            .bind(&pubkey)
+            .fetch_one(&db.pool)
+            .await
+            .ok()
+            .flatten()
+            .map(|t| t.to_rfc3339());
+
             response.classification = Some(ClassificationResponse {
-                labels: classification.labels,
                 scores: classification.scores,
                 bio: classification.bio,
                 confidence: classification.confidence,
+                analyzed_at,
             });
         }
     }

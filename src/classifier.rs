@@ -604,11 +604,14 @@ Scoring rules:
 Generate:
 1. scores: An object mapping each label name to its score (0.0–1.0). Include ALL labels, even those scoring 0.0.
 2. bio: A rich, detailed summary of this person based on their activity. Cover:
-   - Their primary interests and expertise areas
-   - Their role in communities (creator, commentator, builder, organizer, etc.)
-   - Notable patterns in their behavior or content
-   - Any distinctive characteristics that set them apart
-   Do NOT start with "A Nostr user" — that is a given. Start with what distinguishes them. Write as much as needed to capture their profile fully.
+    - Their primary interests and expertise areas
+    - Their role in communities (creator, commentator, builder, organizer, etc.)
+    - Notable patterns in their behavior or content
+    - Any distinctive characteristics that set them apart
+    Rules:
+    - Do NOT mention "Nostr user" or "Nostr power user" — being on Nostr is a given, not a distinguishing trait.
+    - Do NOT mention generic activity patterns like "frequently reacts", "actively engages", or "posts daily updates" — most users do these things. Instead, describe WHAT they react to and WHAT they post about.
+    - Focus on what makes this person unique: their topics, expertise, community roles, and the content they create or amplify.
 3. confidence: 0.0-1.0 indicating how confident you are in the overall classification
 
 Output ONLY valid JSON with this exact structure:

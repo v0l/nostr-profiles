@@ -62,6 +62,23 @@ pub struct Event {
     pub raw_json: String,
 }
 
+/// Compute the storage ID for an event.
+/// For replaceable (kind 0) and addressable (30000-39999) kinds, returns the
+/// NIP-01 coordinate (`kind:pubkey` or `kind:pubkey:dtag`) so that
+/// `ON CONFLICT(id, pubkey) DO UPDATE` naturally replaces stale versions.
+/// For all other kinds, returns the event's own ID (unique per event).
+pub fn event_storage_id(event: &nostr_sdk::Event) -> String {
+    let kind = event.kind.as_u16();
+    if event.kind.is_replaceable() {
+        format!("{}:{}", kind, event.pubkey.to_hex())
+    } else if event.kind.is_addressable() {
+        let dtag = event.tags.identifier().unwrap_or("");
+        format!("{}:{}:{}", kind, event.pubkey.to_hex(), dtag)
+    } else {
+        event.id.to_hex()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Classification {
     pub labels: Vec<String>,
@@ -329,7 +346,58 @@ impl Database {
             tracing::info!("Events table migration complete");
         }
 
+        // Simple key-value table for metadata like epoch
+        sqlx::query(
+            r#"CREATE TABLE IF NOT EXISTS kv (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )"#,
+        )
+        .execute(pool)
+        .await?;
+
         Ok(())
+    }
+
+    /// Get a value from the kv table.
+    pub async fn get_kv(&self, key: &str) -> Result<Option<String>> {
+        let row = sqlx::query_as::<_, (String,)>(
+            r#"SELECT value FROM kv WHERE key = ?"#,
+        )
+        .bind(key)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.map(|(v,)| v))
+    }
+
+    /// Set a value in the kv table.
+    pub async fn set_kv(&self, key: &str, value: &str) -> Result<()> {
+        sqlx::query(
+            r#"INSERT INTO kv (key, value) VALUES (?, ?)
+               ON CONFLICT(key) DO UPDATE SET value = excluded.value"#,
+        )
+        .bind(key)
+        .bind(value)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Mark all classified profiles as needing re-classification.
+    /// Returns the number of profiles queued for re-processing.
+    pub async fn queue_all_for_reclassification(&self) -> Result<u64> {
+        let result = sqlx::query(
+            r#"UPDATE profiles SET
+                is_classified = FALSE,
+                needs_processing = TRUE,
+                updated_at = CURRENT_TIMESTAMP
+               WHERE is_classified = TRUE"#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected())
     }
 
     pub async fn upsert_profile(&self, pubkey: &str) -> Result<()> {
@@ -348,11 +416,14 @@ impl Database {
     }
 
     /// Insert a batch of events in a single transaction. Much faster than individual inserts.
-    pub async fn cache_events_batch(&self, events: &[nostr_sdk::Event]) -> Result<()> {
+    /// Returns the net new event count per pubkey (accounts for replaceable events that
+    /// overwrite older versions — those result in net 0, not +1).
+    pub async fn cache_events_batch(&self, events: &[nostr_sdk::Event]) -> Result<std::collections::HashMap<String, i64>> {
         let mut tx = self.pool.begin().await?;
+        let mut net_new: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
 
         for event in events {
-            let event_id = event.id.to_hex();
+            let storage_id = event_storage_id(event);
             let pubkey = event.pubkey.to_hex();
             let kind = (event.kind.as_u16() as u32) as i64;
             let created_at = event.created_at.as_secs() as i64;
@@ -398,19 +469,30 @@ impl Database {
                 .await?;
             }
 
-            // Insert event
-            sqlx::query(
+            // Insert event — replaceable/addressable events use coordinate as ID,
+            // so ON CONFLICT ... DO UPDATE replaces the old version (only if newer).
+            let result = sqlx::query(
                 r#"INSERT INTO events (id, pubkey, kind, created_at, raw_json)
                    VALUES (?, ?, ?, ?, ?)
-                   ON CONFLICT(id, pubkey) DO NOTHING"#,
+                   ON CONFLICT(id, pubkey) DO UPDATE SET
+                       kind = excluded.kind,
+                       created_at = excluded.created_at,
+                       raw_json = excluded.raw_json
+                   WHERE excluded.created_at > events.created_at"#,
             )
-            .bind(&event_id)
+            .bind(&storage_id)
             .bind(&pubkey)
             .bind(kind)
             .bind(created_at)
             .bind(&raw_json)
             .execute(&mut *tx)
             .await?;
+
+            // If this was a new row (not an update of an existing one), count it.
+            // For replaceable events, an update means net 0 (old replaced, not added).
+            if result.rows_affected() > 0 {
+                *net_new.entry(pubkey.clone()).or_insert(0) += 1;
+            }
 
             // For zap receipts, also index under sender pubkey
             if kind == 9735 {
@@ -432,18 +514,26 @@ impl Database {
                             .execute(&mut *tx)
                             .await?;
 
-                            sqlx::query(
+                            let result = sqlx::query(
                                 r#"INSERT INTO events (id, pubkey, kind, created_at, raw_json)
                                    VALUES (?, ?, ?, ?, ?)
-                                   ON CONFLICT(id, pubkey) DO NOTHING"#,
+                                   ON CONFLICT(id, pubkey) DO UPDATE SET
+                                       kind = excluded.kind,
+                                       created_at = excluded.created_at,
+                                       raw_json = excluded.raw_json
+                                   WHERE excluded.created_at > events.created_at"#,
                             )
-                            .bind(&event_id)
+                            .bind(&storage_id)
                             .bind(&sender_pubkey)
                             .bind(kind)
                             .bind(created_at)
                             .bind(&raw_json)
                             .execute(&mut *tx)
                             .await?;
+
+                            if result.rows_affected() > 0 {
+                                *net_new.entry(sender_pubkey).or_insert(0) += 1;
+                            }
                         }
                     }
                 }
@@ -451,7 +541,7 @@ impl Database {
         }
 
         tx.commit().await?;
-        Ok(())
+        Ok(net_new)
     }
 
     /// Check if a profile is already classified — lightweight query for the collector.
@@ -468,7 +558,7 @@ impl Database {
     }
 
     pub async fn cache_event(&self, event: &nostr_sdk::Event) -> Result<()> {
-        let event_id = event.id.to_hex();
+        let storage_id = event_storage_id(event);
         let pubkey = event.pubkey.to_hex();
         let kind = (event.kind.as_u16() as u32) as i64;
         let created_at = event.created_at.as_secs() as i64;
@@ -486,10 +576,14 @@ impl Database {
             r#"
             INSERT INTO events (id, pubkey, kind, created_at, raw_json)
             VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(id, pubkey) DO NOTHING
+            ON CONFLICT(id, pubkey) DO UPDATE SET
+                kind = excluded.kind,
+                created_at = excluded.created_at,
+                raw_json = excluded.raw_json
+            WHERE excluded.created_at > events.created_at
             "#,
         )
-        .bind(&event_id)
+        .bind(&storage_id)
         .bind(&pubkey)
         .bind(kind)
         .bind(created_at)
@@ -516,10 +610,14 @@ impl Database {
                             r#"
                             INSERT INTO events (id, pubkey, kind, created_at, raw_json)
                             VALUES (?, ?, ?, ?, ?)
-                            ON CONFLICT(id, pubkey) DO NOTHING
+                            ON CONFLICT(id, pubkey) DO UPDATE SET
+                                kind = excluded.kind,
+                                created_at = excluded.created_at,
+                                raw_json = excluded.raw_json
+                            WHERE excluded.created_at > events.created_at
                             "#,
                         )
-                        .bind(&event_id)
+                        .bind(&storage_id)
                         .bind(&sender_pubkey)
                         .bind(kind)
                         .bind(created_at)
@@ -527,7 +625,7 @@ impl Database {
                         .execute(&self.pool)
                         .await?;
                     } else {
-                        tracing::warn!("Zap receipt {} has invalid 9734 signature, skipping sender indexing", event_id);
+                        tracing::warn!("Zap receipt {} has invalid 9734 signature, skipping sender indexing", storage_id);
                     }
                 }
             }
@@ -845,9 +943,9 @@ impl Database {
     }
 
     pub async fn get_recent_classifications(&self, limit: i64) -> Result<Vec<crate::http_server::RecentClassification>> {
-        let rows = sqlx::query_as::<_, (String, Option<String>, Option<String>, String, String, String, f64, Option<chrono::DateTime<chrono::Utc>>)>(
+        let rows = sqlx::query_as::<_, (String, Option<String>, Option<String>, String, String, f64, Option<chrono::DateTime<chrono::Utc>>, Option<String>)>(
             r#"
-            SELECT p.pubkey, p.name, p.picture, c.labels, c.scores, c.bio, c.confidence, c.analyzed_at
+            SELECT p.pubkey, p.name, p.picture, c.scores, c.bio, c.confidence, c.analyzed_at, p.metadata_json
             FROM classifications c
             JOIN profiles p ON c.pubkey = p.pubkey
             ORDER BY c.analyzed_at DESC
@@ -858,18 +956,17 @@ impl Database {
         .fetch_all(&self.pool)
         .await?;
 
-        let results = rows.into_iter().map(|(pubkey, name, picture, labels, scores, bio, confidence, analyzed_at)| {
-            let parsed_labels: Vec<String> = serde_json::from_str(&labels).unwrap_or_default();
+        let results = rows.into_iter().map(|(pubkey, name, picture, scores, bio, confidence, analyzed_at, metadata_json)| {
             let parsed_scores: std::collections::HashMap<String, f64> = serde_json::from_str(&scores).unwrap_or_default();
             crate::http_server::RecentClassification {
                 pubkey,
                 name,
                 picture,
-                labels: parsed_labels,
                 scores: parsed_scores,
                 bio,
                 confidence,
                 analyzed_at: analyzed_at.map(|t| t.to_rfc3339()),
+                metadata_json,
             }
         }).collect();
 
@@ -921,9 +1018,9 @@ impl Database {
         // Add prefix matching to each term so "bitc" matches "bitcoin"
         let fts_query = Self::prepare_fts_query(query);
 
-        let rows = sqlx::query_as::<_, (String, Option<String>, Option<String>, String, String, String, f64, Option<chrono::DateTime<chrono::Utc>>)>(
+        let rows = sqlx::query_as::<_, (String, Option<String>, Option<String>, String, String, f64, Option<chrono::DateTime<chrono::Utc>>, Option<String>)>(
             r#"
-            SELECT p.pubkey, p.name, p.picture, c.labels, c.scores, c.bio, c.confidence, c.analyzed_at
+            SELECT p.pubkey, p.name, p.picture, c.scores, c.bio, c.confidence, c.analyzed_at, p.metadata_json
             FROM classifications c
             JOIN profiles p ON c.pubkey = p.pubkey
             JOIN classifications_fts fts ON fts.rowid = c.id
@@ -937,18 +1034,17 @@ impl Database {
         .fetch_all(&self.pool)
         .await?;
 
-        let results = rows.into_iter().map(|(pubkey, name, picture, labels, scores, bio, confidence, analyzed_at)| {
-            let parsed_labels: Vec<String> = serde_json::from_str(&labels).unwrap_or_default();
+        let results = rows.into_iter().map(|(pubkey, name, picture, scores, bio, confidence, analyzed_at, metadata_json)| {
             let parsed_scores: std::collections::HashMap<String, f64> = serde_json::from_str(&scores).unwrap_or_default();
             crate::http_server::RecentClassification {
                 pubkey,
                 name,
                 picture,
-                labels: parsed_labels,
                 scores: parsed_scores,
                 bio,
                 confidence,
                 analyzed_at: analyzed_at.map(|t| t.to_rfc3339()),
+                metadata_json,
             }
         }).collect();
 

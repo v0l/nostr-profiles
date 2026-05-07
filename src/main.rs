@@ -22,6 +22,11 @@ use anyhow::Result;
 use std::sync::Arc;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
+/// Classification epoch. Increment this when the system prompt, taxonomy,
+/// classification flow, or any other factor changes enough that all previously
+/// classified profiles should be re-processed.
+const CLASSIFICATION_EPOCH: u32 = 1;
+
 #[tokio::main]
 async fn main() -> Result<()> {
     rustls::crypto::ring::default_provider()
@@ -42,6 +47,18 @@ async fn main() -> Result<()> {
 
     let db = Arc::new(Database::new(&config.database.path).await?);
     tracing::info!("Database initialized at {}", config.database.path);
+
+    // Check classification epoch — if bumped, re-classify all profiles
+    let stored_epoch: u32 = db.get_kv("epoch").await?.and_then(|v| v.parse().ok()).unwrap_or(0);
+    if CLASSIFICATION_EPOCH > stored_epoch {
+        tracing::info!(
+            "Classification epoch changed: {} -> {}, queuing all profiles for re-classification",
+            stored_epoch, CLASSIFICATION_EPOCH
+        );
+        let count = db.queue_all_for_reclassification().await?;
+        tracing::info!("Queued {} profiles for re-classification", count);
+        db.set_kv("epoch", &CLASSIFICATION_EPOCH.to_string()).await?;
+    }
 
     let nostr = NostrClient::new(&config.nostr.relays, config.nostr.nsec.as_deref()).await?;
     nostr.connect().await;
