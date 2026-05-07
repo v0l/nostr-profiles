@@ -11,6 +11,7 @@ RUN cargo build --release && \
 # ── Rust application build ────────────────────────────────────────────────────
 FROM rust-deps AS rust-build
 COPY src ./src
+COPY migrations ./migrations
 COPY dashboard.html ./
 RUN touch src/main.rs
 RUN cargo build --release && \
