@@ -307,10 +307,11 @@
                         <h3 style=${{ color: '#fff', fontSize: '14px', marginBottom: '10px', textTransform: 'uppercase', letterSpacing: '0.5px' }}>Classification</h3>
                         ${is_classified && classification ? html`
                             <div class="labels">
-                                ${classification.labels.map(l => {
-                                    const score = classification.scores?.[l] ?? 0.5;
-                                    return html`<${LabelPill} key=${l} label=${l} score=${score} />`;
-                                })}
+                                ${Object.entries(classification.scores)
+                                    .sort((a, b) => b[1] - a[1])
+                                    .filter(([_, s]) => s >= 0.3)
+                                    .map(([l, score]) => html`<${LabelPill} key=${l} label=${l} score=${score} />`)
+                                }
                             </div>
                             <p class="bio">${classification.bio}</p>
                             <div class="confidence">
@@ -339,10 +340,12 @@
                         <span class="recent-time">${timeAgo(item.analyzed_at)}</span>
                     </div>
                     <div class="labels">
-                        ${item.labels.slice(0, 5).map(l => {
-                            const score = item.scores?.[l] ?? 0.5;
-                            return html`<${LabelPill} key=${l} label=${l} score=${score} />`;
-                        })}
+                        ${Object.entries(item.scores)
+                            .sort((a, b) => b[1] - a[1])
+                            .filter(([_, s]) => s >= 0.3)
+                            .slice(0, 5)
+                            .map(([l, score]) => html`<${LabelPill} key=${l} label=${l} score=${score} />`)
+                        }
                     </div>
                 </div>
             `;
