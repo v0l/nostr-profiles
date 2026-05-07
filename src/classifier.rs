@@ -138,7 +138,7 @@ impl Classifier {
             ChatCompletionTools::Function(ChatCompletionTool {
                 function: FunctionObject {
                     name: "describe_image".to_string(),
-                    description: Some("Describe an image by its URL. Downloads the image and returns a detailed text description of what is shown (objects, people, text, scenes, style). ALWAYS call this for any image URL you see — you cannot determine what an image contains from its URL alone. This includes profile picture URLs (e.g. Profile Image: https://...) and image URLs in event content (e.g. .jpg, .png, .gif, .webp).".to_string()),
+                    description: Some("Describe an image or video by its URL. Downloads the media and returns a detailed text description. For images, describes objects, people, text, scenes, and style. For videos, extracts key frames and describes what's happening across the video — actions, settings, people, and visual content. ALWAYS call this for any image or video URL you see — you cannot determine what media contains from its URL alone. This includes profile picture URLs (e.g. Profile Image: https://...), image URLs (.jpg, .png, .gif, .webp), and video URLs (.mp4, .webm, .mov, .avi, .mkv).".to_string()),
                     parameters: Some(serde_json::json!({
                         "type": "object",
                         "properties": {
@@ -614,8 +614,16 @@ impl Classifier {
         Ok(STANDARD.encode(&jpeg_bytes))
     }
 
-    pub async fn describe_image(&self, path: &str) -> Result<String> {
+pub async fn describe_image(&self, path: &str) -> Result<String> {
         let image_content = format!("data:image/jpeg;base64,{}", self.encode_image(&path).await?);
+
+        // Detect if this is a video collage (files ending in .video.collage.jpg)
+        let is_video_collage = path.contains(".video.collage.");
+        let prompt = if is_video_collage {
+            "This image is a collage of key frames extracted from a video. Describe what is happening in the video based on these frames. What actions, scenes, people, text, and settings are shown? How does the content progress across the frames? Be specific and objective. Keep description concise.".to_string()
+        } else {
+            "Describe this image in detail. What is shown? What colors, objects, people, text, or scenes are visible? Be specific and objective. Keep description concise.".to_string()
+        };
 
         let request = CreateChatCompletionRequest {
             model: self.model.to_string(),
@@ -623,7 +631,7 @@ impl Classifier {
                 ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
                     content: ChatCompletionRequestUserMessageContent::Array(vec![
                         ChatCompletionRequestUserMessageContentPart::Text(ChatCompletionRequestMessageContentPartText{
-                            text: "Describe this image in detail. What is shown? What colors, objects, people, text, or scenes are visible? Be specific and objective. Keep description concise.".to_string(),
+                            text: prompt,
                         }),
                         ChatCompletionRequestUserMessageContentPart::ImageUrl(ChatCompletionRequestMessageContentPartImage {
                             image_url: ImageUrl {

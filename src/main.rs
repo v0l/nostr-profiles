@@ -10,6 +10,7 @@ mod nostr_client;
 mod nostr_collector;
 mod profile_cache;
 mod search_relay;
+mod video;
 
 use crate::classifier::Classifier;
 use crate::config::Config;

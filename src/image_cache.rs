@@ -26,7 +26,7 @@ impl ImageCache {
         Ok(Self {
             cache_dir,
             client: Client::builder()
-                .timeout(std::time::Duration::from_secs(5))
+                .timeout(std::time::Duration::from_secs(30))
                 .default_headers(headers)
                 .build()?,
             in_flight: Arc::new(StdMutex::new(HashMap::new())),
@@ -40,6 +40,9 @@ impl ImageCache {
             .clone()
     }
 
+    /// Download a file from URL. For images, returns (local_path, content_hash).
+    /// For videos, downloads the video and extracts a collage of frames, returning
+    /// the collage image path and hash.
     pub async fn download(&self, url: &str) -> Result<Option<(String, String)>> {
         // Dedupe concurrent downloads of the same URL
         let lock = self.get_lock(url);
@@ -47,7 +50,12 @@ impl ImageCache {
 
         // Check if URL contains a SHA256 hash (64 hex chars)
         let url_hash = extract_sha256_from_url(url);
-        
+
+        // For video URLs, download the video and extract a collage
+        if crate::video::is_video_url(url) {
+            return self.download_video(url, &url_hash).await;
+        }
+
         // If we have a URL hash, check if we already cached it by content hash
         // We need to check all extensions since we don't know the format yet
         if let Some(ref hash) = url_hash {
@@ -58,7 +66,7 @@ impl ImageCache {
                 }
             }
         }
-        
+
         info!("Downloading {}", url);
         match self.client.get(url).send().await {
             Ok(response) => {
@@ -76,19 +84,68 @@ impl ImageCache {
 
                 // Compute SHA256 hash of the actual file content
                 let content_hash = hex::encode(Sha256::digest(&bytes));
-                
+
                 // Use content hash as the filename with correct extension
                 let final_path = self.cache_dir.join(format!("{content_hash}.{ext}"));
-                
+
                 // Only write if it doesn't exist yet
                 if !final_path.exists() {
                     tokio::fs::write(&final_path, &bytes).await?;
                 }
-                
+
                 Ok(Some((final_path.to_string_lossy().to_string(), content_hash)))
             }
             Err(_) => Ok(None),
         }
+    }
+
+    /// Download a video, extract a collage of frames, and cache the result.
+    async fn download_video(&self, url: &str, url_hash: &Option<String>) -> Result<Option<(String, String)>> {
+        // Check if collage already exists by URL hash
+        if let Some(hash) = url_hash {
+            let collage_path = self.cache_dir.join(format!("{hash}.video.collage.jpg"));
+            if collage_path.exists() {
+                return Ok(Some((collage_path.to_string_lossy().to_string(), hash.clone())));
+            }
+        }
+
+        info!("Downloading video {}", url);
+        let response = match self.client.get(url).send().await {
+            Ok(r) => r,
+            Err(_) => return Ok(None),
+        };
+
+        if !response.status().is_success() {
+            return Ok(None);
+        }
+
+        let bytes = response.bytes().await?;
+        if bytes.is_empty() {
+            return Ok(None);
+        }
+
+        let content_hash = hex::encode(Sha256::digest(&bytes));
+
+        // Save video to temp file
+        let video_path = self.cache_dir.join(format!("{content_hash}.video.tmp"));
+        tokio::fs::write(&video_path, &bytes).await?;
+
+        // Extract collage (blocking operation, spawn on blocking thread)
+        let video_path_str = video_path.to_string_lossy().to_string();
+        let collage_result = tokio::task::spawn_blocking(move || {
+            crate::video::extract_video_collage(&video_path_str)
+        }).await??;
+
+        // Rename collage to its final cache location
+        let final_collage = self.cache_dir.join(format!("{content_hash}.video.collage.jpg"));
+        if collage_result != final_collage.to_string_lossy() {
+            tokio::fs::rename(&collage_result, &final_collage).await?;
+        }
+
+        // Clean up the temp video file
+        let _ = tokio::fs::remove_file(&video_path).await;
+
+        Ok(Some((final_collage.to_string_lossy().to_string(), content_hash)))
     }
 }
 
