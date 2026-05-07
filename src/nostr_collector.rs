@@ -1,10 +1,16 @@
 use crate::config::Config;
-use crate::db::{Database, CLASSIFIABLE_KINDS};
+use crate::count_cache::{EventCountCache, FollowerCache};
+use crate::db::Database;
 use crate::job_queue::Job;
 use crate::nostr_client::NostrClient;
 use anyhow::Result;
 use nostr_sdk::prelude::*;
 use std::sync::Arc;
+
+/// Number of events to accumulate before flushing to DB.
+const BATCH_SIZE: usize = 50;
+/// Max time (ms) to hold a batch before flushing, even if under BATCH_SIZE.
+const FLUSH_INTERVAL_MS: u64 = 2000;
 
 pub struct NostrCollector;
 
@@ -18,7 +24,10 @@ impl NostrCollector {
     ) -> Result<()> {
         let client = nostr.client();
 
-        let kinds: Vec<Kind> = CLASSIFIABLE_KINDS.iter().map(|k| Kind::from(*k)).collect();
+        let kinds: Vec<Kind> = crate::db::CLASSIFIABLE_KINDS.iter().map(|k| Kind::from(*k)).collect();
+
+        let event_counts = EventCountCache::new(db.clone());
+        let follower_cache = FollowerCache::new(db.clone(), nostr.clone());
 
         loop {
             let filter = Filter::new()
@@ -31,98 +40,130 @@ impl NostrCollector {
                 continue;
             }
 
-            tracing::info!("Subscribed to classifiable event kinds {:?}", CLASSIFIABLE_KINDS);
+            tracing::info!("Subscribed to classifiable event kinds {:?}", crate::db::CLASSIFIABLE_KINDS);
 
             let mut rx = client.notifications();
+            let mut batch: Vec<Event> = Vec::with_capacity(BATCH_SIZE);
+            let mut flush_tick = tokio::time::interval(std::time::Duration::from_millis(FLUSH_INTERVAL_MS));
+            flush_tick.tick().await; // consume initial tick
 
-            while let Ok(notification) = rx.recv().await {
-                if let RelayPoolNotification::Event { event, .. } = notification {
-                    // Only cache classifiable kinds — skip everything else
-                    if !crate::db::is_classifiable_kind(event.kind.as_u16()) {
-                        continue;
-                    }
-
-                    // Store the event
-                    if let Err(e) = db.cache_event(&event).await {
-                        tracing::error!("Failed to cache event: {}", e);
-                        continue;
-                    }
-
-                    // Check if this pubkey has enough events to trigger classification
-                    let pubkey_hex = event.pubkey.to_hex();
-                    let (event_count, is_classified) = match db.get_profile(&pubkey_hex).await {
-                        Ok(r) => r,
-                        Err(e) => {
-                            tracing::error!("Failed to get profile for {}: {}", pubkey_hex, e);
-                            continue;
-                        }
-                    };
-
-                    if event_count >= config.processing.event_threshold && !is_classified {
-                        // Check minimum follower count to filter out bots / test accounts
-                        if config.processing.min_followers > 0 {
-                            let cached_count = db.get_profile_by_pubkey(&pubkey_hex)
-                                .await?
-                                .and_then(|p| p.follower_count);
-
-                            let follower_count = match cached_count {
-                                Some(c) => c as usize,
-                                None => {
-                                    // Not cached — fetch from relays and cache the result
-                                    match nostr.fetch_follower_count(&pubkey_hex, 5).await {
-                                        Ok(count) => {
-                                            if let Err(e) = db.set_follower_count(&pubkey_hex, count).await {
-                                                tracing::warn!("Failed to cache follower count for {}: {}", pubkey_hex, e);
-                                            }
-                                            count
-                                        }
-                                        Err(e) => {
-                                            tracing::warn!(
-                                                "Failed to fetch follower count for {}: {}, skipping check",
-                                                pubkey_hex,
-                                                e
-                                            );
-                                            // Can't determine — skip the check, let it through
-                                            continue;
-                                        }
-                                    }
+            loop {
+                tokio::select! {
+                    notification = rx.recv() => {
+                        match notification {
+                            Ok(RelayPoolNotification::Event { event, .. }) => {
+                                batch.push(*event);
+                                if batch.len() >= BATCH_SIZE {
+                                    Self::flush_batch(
+                                        &batch, &db, &job_queue, &config, &event_counts, &follower_cache,
+                                    ).await;
+                                    batch.clear();
                                 }
-                            };
-
-                            if follower_count < config.processing.min_followers {
-                                tracing::debug!(
-                                    "Skipping profile {} — only {} followers (min: {})",
-                                    pubkey_hex,
-                                    follower_count,
-                                    config.processing.min_followers
-                                );
-                                continue;
                             }
+                            Ok(_) => {} // ignore non-event notifications
+                            Err(_) => break, // stream closed
                         }
-
-                        let job = Job {
-                            pubkey: pubkey_hex.clone(),
-                        };
-
-                        if job_queue.enqueue(job).await? {
-                            tracing::info!(
-                                "Queued profile {} for processing ({} events)",
-                                pubkey_hex,
-                                event_count
-                            );
-                        } else {
-                            tracing::debug!(
-                                "Profile {} already queued, skipping",
-                                pubkey_hex
-                            );
+                    }
+                    _ = flush_tick.tick() => {
+                        if !batch.is_empty() {
+                            Self::flush_batch(
+                                &batch, &db, &job_queue, &config, &event_counts, &follower_cache,
+                            ).await;
+                            batch.clear();
                         }
                     }
                 }
             }
 
-            // If we get here, the notification stream closed (relay disconnect, etc.)
             tracing::warn!("Notification stream closed, reconnecting in 5s...");
+            // Flush any remaining events before reconnecting
+            if !batch.is_empty() {
+                Self::flush_batch(
+                    &batch, &db, &job_queue, &config, &event_counts, &follower_cache,
+                ).await;
+            }
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        }
+    }
+
+    /// Flush a batch of events to the DB, update in-memory counts, and enqueue
+    /// any profiles that cross the threshold.
+    async fn flush_batch(
+        events: &[Event],
+        db: &Arc<Database>,
+        job_queue: &Arc<crate::job_queue::JobQueue>,
+        config: &Config,
+        event_counts: &EventCountCache,
+        follower_cache: &FollowerCache,
+    ) {
+        // 1. Batch-write events to DB
+        if let Err(e) = db.cache_events_batch(events).await {
+            tracing::error!("Failed to cache event batch: {}", e);
+            // Fall through — we still try to process what we can
+        }
+
+        // 2. Count new events per pubkey from this batch
+        let mut new_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for event in events {
+            *new_counts.entry(event.pubkey.to_hex()).or_insert(0) += 1;
+        }
+
+        // 3. Update in-memory counts and collect pubkeys that cross the threshold
+        let mut to_check: Vec<(String, usize)> = Vec::new();
+        for (pubkey, added) in &new_counts {
+            let total = event_counts.increment(pubkey, *added).await;
+            to_check.push((pubkey.clone(), total));
+        }
+
+        // 4. For profiles crossing threshold, check classification status and follower count
+        for (pubkey, count) in to_check {
+            if count < config.processing.event_threshold {
+                continue;
+            }
+
+            let is_classified = match db.get_profile_is_classified(&pubkey).await {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::error!("Failed to check classification status for {}: {}", pubkey, e);
+                    continue;
+                }
+            };
+
+            if is_classified {
+                continue;
+            }
+
+            // Follower check — spawn so we don't block the collector loop
+            let follower_cache = follower_cache.clone();
+            let job_queue = Arc::clone(job_queue);
+            let min_followers = config.processing.min_followers;
+            let event_count = count;
+
+            tokio::spawn(async move {
+                let meets_threshold = if min_followers > 0 {
+                    match follower_cache.get(&pubkey).await {
+                        Some(c) => c >= min_followers,
+                        None => false, // couldn't determine — skip, will retry next event
+                    }
+                } else {
+                    true
+                };
+
+                if meets_threshold {
+                    let job = Job { pubkey: pubkey.clone() };
+                    if job_queue.enqueue(job).await.unwrap_or(false) {
+                        tracing::info!(
+                            "Queued profile {} for processing ({} events)",
+                            pubkey, event_count
+                        );
+                    }
+                } else if min_followers > 0 {
+                    tracing::debug!(
+                        "Skipping profile {} — below min_followers threshold (min: {})",
+                        pubkey, min_followers
+                    );
+                }
+            });
         }
     }
 }

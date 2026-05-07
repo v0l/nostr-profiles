@@ -1,5 +1,6 @@
 mod classifier;
 mod config;
+mod count_cache;
 mod db;
 mod format;
 mod http_server;

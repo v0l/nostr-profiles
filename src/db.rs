@@ -37,11 +37,6 @@ pub const CLASSIFIABLE_KINDS: &[u16] = &[
     30023,  // Long-form Content
 ];
 
-/// Check if a nostr event kind is relevant for profile classification.
-pub fn is_classifiable_kind(kind: u16) -> bool {
-    CLASSIFIABLE_KINDS.contains(&kind)
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct Profile {
     pub pubkey: String,
@@ -352,6 +347,126 @@ impl Database {
         Ok(())
     }
 
+    /// Insert a batch of events in a single transaction. Much faster than individual inserts.
+    pub async fn cache_events_batch(&self, events: &[nostr_sdk::Event]) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+
+        for event in events {
+            let event_id = event.id.to_hex();
+            let pubkey = event.pubkey.to_hex();
+            let kind = (event.kind.as_u16() as u32) as i64;
+            let created_at = event.created_at.as_secs() as i64;
+            let raw_json = serde_json::to_string(event)?;
+
+            // Ensure profile exists
+            sqlx::query(
+                r#"INSERT INTO profiles (pubkey, needs_processing) VALUES (?, FALSE)
+                   ON CONFLICT(pubkey) DO UPDATE SET updated_at = CURRENT_TIMESTAMP"#,
+            )
+            .bind(&pubkey)
+            .execute(&mut *tx)
+            .await?;
+
+            // Kind 0 = metadata — extract profile fields
+            if kind == 0 {
+                let content = &event.content;
+                let meta: nostr_sdk::Metadata = match serde_json::from_str(content) {
+                    Ok(v) => v,
+                    Err(_) => continue, // skip unparseable metadata
+                };
+
+                sqlx::query(
+                    r#"UPDATE profiles SET
+                        name = COALESCE(?, name),
+                        about = COALESCE(?, about),
+                        picture = COALESCE(?, picture),
+                        nip05 = COALESCE(?, nip05),
+                        metadata_json = ?,
+                        metadata_created_at = ?,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE pubkey = ? AND (metadata_created_at IS NULL OR metadata_created_at < ?)"#,
+                )
+                .bind(meta.name.as_deref())
+                .bind(meta.about.as_deref())
+                .bind(meta.picture.as_deref())
+                .bind(meta.nip05.as_deref())
+                .bind(&raw_json)
+                .bind(created_at)
+                .bind(&pubkey)
+                .bind(created_at)
+                .execute(&mut *tx)
+                .await?;
+            }
+
+            // Insert event
+            sqlx::query(
+                r#"INSERT INTO events (id, pubkey, kind, created_at, raw_json)
+                   VALUES (?, ?, ?, ?, ?)
+                   ON CONFLICT(id, pubkey) DO NOTHING"#,
+            )
+            .bind(&event_id)
+            .bind(&pubkey)
+            .bind(kind)
+            .bind(created_at)
+            .bind(&raw_json)
+            .execute(&mut *tx)
+            .await?;
+
+            // For zap receipts, also index under sender pubkey
+            if kind == 9735 {
+                if let Some(zap_request_json) = event.tags.iter()
+                    .filter_map(|t| match t.as_standardized() {
+                        Some(nostr_sdk::TagStandard::Description(desc)) => Some(desc.as_str()),
+                        _ => None,
+                    })
+                    .next()
+                {
+                    if let Ok(zap_request) = nostr_sdk::Event::from_json(zap_request_json) {
+                        if zap_request.verify().is_ok() {
+                            let sender_pubkey = zap_request.pubkey.to_hex();
+                            sqlx::query(
+                                r#"INSERT INTO profiles (pubkey, needs_processing) VALUES (?, FALSE)
+                                   ON CONFLICT(pubkey) DO UPDATE SET updated_at = CURRENT_TIMESTAMP"#,
+                            )
+                            .bind(&sender_pubkey)
+                            .execute(&mut *tx)
+                            .await?;
+
+                            sqlx::query(
+                                r#"INSERT INTO events (id, pubkey, kind, created_at, raw_json)
+                                   VALUES (?, ?, ?, ?, ?)
+                                   ON CONFLICT(id, pubkey) DO NOTHING"#,
+                            )
+                            .bind(&event_id)
+                            .bind(&sender_pubkey)
+                            .bind(kind)
+                            .bind(created_at)
+                            .bind(&raw_json)
+                            .execute(&mut *tx)
+                            .await?;
+                        }
+                    }
+                }
+            }
+        }
+
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Check if a profile is already classified — lightweight query for the collector.
+    pub async fn get_profile_is_classified(&self, pubkey: &str) -> Result<bool> {
+        let is_classified: bool = sqlx::query_scalar(
+            r#"SELECT is_classified FROM profiles WHERE pubkey = ?"#,
+        )
+        .bind(pubkey)
+        .fetch_one(&self.pool)
+        .await
+        .unwrap_or(false);
+
+        Ok(is_classified)
+    }
+
     pub async fn cache_event(&self, event: &nostr_sdk::Event) -> Result<()> {
         let event_id = event.id.to_hex();
         let pubkey = event.pubkey.to_hex();
@@ -478,24 +593,6 @@ impl Database {
         let count = query.fetch_one(&self.pool).await?;
 
         Ok(count as usize)
-    }
-
-    pub async fn get_profile(&self, pubkey: &str) -> Result<(usize, bool)> {
-        let kinds: Vec<i64> = CLASSIFIABLE_KINDS.iter().map(|k| *k as i64).collect();
-        let placeholders = kinds.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-        let sql = format!(
-            "SELECT (SELECT COUNT(*) FROM events WHERE pubkey = ? AND kind IN ({})), is_classified FROM profiles WHERE pubkey = ?",
-            placeholders
-        );
-
-        let mut query = sqlx::query_as::<_, (i64, bool)>(&sql)
-            .bind(pubkey);
-        for kind in &kinds {
-            query = query.bind(*kind);
-        }
-        let (count, is_classified) = query.bind(pubkey).fetch_one(&self.pool).await?;
-
-        Ok((count as usize, is_classified))
     }
 
     pub async fn get_profile_details(&self, pubkey: &str) -> Result<Profile> {
