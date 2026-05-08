@@ -121,10 +121,11 @@ async fn e2e_classify_reaction_infers_interest() -> Result<()> {
     let image_cache_dir = tempfile::tempdir()?;
     let image_cache = ImageCache::new(image_cache_dir.path().to_str().unwrap())?;
     let profile_cache = ProfileCache::new(db.clone(), nostr.clone(), 7);
+    let og_cache = crate::opengraph::OpenGraphCache::new(128);
 
     let classifier = Classifier::new(
         &config.llm,
-        nostr, profile_cache, image_cache, db,
+        nostr, profile_cache, image_cache, og_cache, db,
         crate::config::load_label_taxonomy(config.labels.taxonomy_file.as_deref()),
         config.labels.min_score,
         std::time::Duration::from_secs(config.processing.tool_call_timeout_secs),

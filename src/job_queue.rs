@@ -10,12 +10,14 @@ use tokio::sync::{mpsc, Mutex};
 #[derive(Debug, Clone)]
 pub struct Job {
     pub pubkey: String,
+    pub retry_count: u8,
 }
 
 pub struct JobQueue {
     tx: mpsc::Sender<Job>,
     rx: Arc<Mutex<mpsc::Receiver<Job>>>,
     max_workers: usize,
+    max_retries: u8,
     queued_pubkeys: Arc<Mutex<HashSet<String>>>,
     cache_days: u64,
     job_timeout: Duration,
@@ -27,6 +29,7 @@ impl Clone for JobQueue {
             tx: self.tx.clone(),
             rx: self.rx.clone(),
             max_workers: self.max_workers,
+            max_retries: self.max_retries,
             queued_pubkeys: self.queued_pubkeys.clone(),
             cache_days: self.cache_days,
             job_timeout: self.job_timeout,
@@ -35,13 +38,14 @@ impl Clone for JobQueue {
 }
 
 impl JobQueue {
-    pub fn new(max_workers: usize, cache_days: u64, job_timeout: Duration) -> Self {
+    pub fn new(max_workers: usize, max_retries: u8, cache_days: u64, job_timeout: Duration) -> Self {
         let (tx, rx) = mpsc::channel(10000);
 
         Self {
             tx,
             rx: Arc::new(Mutex::new(rx)),
             max_workers,
+            max_retries,
             queued_pubkeys: Arc::new(Mutex::new(HashSet::new())),
             cache_days,
             job_timeout,
@@ -84,6 +88,7 @@ impl JobQueue {
             let queue = queue_clone.clone();
             let cache_days = self.cache_days;
             let job_timeout = self.job_timeout;
+            let max_retries = self.max_retries;
 
             let worker = tokio::spawn(async move {
                 loop {
@@ -120,9 +125,38 @@ impl JobQueue {
                                 pubkey,
                                 e
                             );
+                            // Retry if under the limit
+                            if job.retry_count < max_retries {
+                                let retry_job = Job {
+                                    pubkey: pubkey.clone(),
+                                    retry_count: job.retry_count + 1,
+                                };
+                                // Remove from queued set so enqueue doesn't skip it
+                                queue.dequeue(&pubkey).await;
+                                if let Ok(true) = queue.enqueue(retry_job).await {
+                                    tracing::info!(
+                                        "Retrying profile {} (attempt {}/{})",
+                                        pubkey,
+                                        job.retry_count + 1,
+                                        max_retries
+                                    );
+                                } else {
+                                    tracing::warn!(
+                                        "Could not re-enqueue profile {} for retry",
+                                        pubkey
+                                    );
+                                }
+                                continue;
+                            } else {
+                                tracing::warn!(
+                                    "Profile {} exceeded max retries ({}), giving up",
+                                    pubkey,
+                                    max_retries
+                                );
+                            }
                         }
                     }
-                    // Remove from queue tracking after processing
+                    // Remove from queue tracking after successful processing or final failure
                     queue.dequeue(&pubkey).await;
                 }
             });
@@ -138,6 +172,7 @@ impl JobQueue {
             tx: self.tx.clone(),
             rx: self.rx.clone(),
             max_workers: self.max_workers,
+            max_retries: self.max_retries,
             queued_pubkeys: self.queued_pubkeys.clone(),
             cache_days: self.cache_days,
             job_timeout: self.job_timeout,
@@ -237,6 +272,23 @@ pub fn build_context(
         ctx.push_str(&format!("Labels: {}\n", prev.labels.join(", ")));
         ctx.push_str(&format!("Bio: {}\n", prev.bio));
         ctx.push_str(&format!("Confidence: {:.0}%\n", prev.confidence * 100.0));
+    }
+
+    // Event kind breakdown
+    if !events.is_empty() {
+        let mut kind_counts: std::collections::HashMap<i64, usize> = std::collections::HashMap::new();
+        for event in events {
+            *kind_counts.entry(event.kind).or_insert(0) += 1;
+        }
+        let mut sorted: Vec<_> = kind_counts.into_iter().collect();
+        sorted.sort_by(|a, b| b.1.cmp(&a.1));
+
+        ctx.push_str("\n=== EVENT KIND BREAKDOWN ===\n\n");
+        for (kind, count) in &sorted {
+            let kind_name = crate::format::kind_name(*kind as u16);
+            ctx.push_str(&format!("Kind {} ({}): {} events\n", kind, kind_name, count));
+        }
+        ctx.push_str(&format!("\nTotal: {} events\n", events.len()));
     }
 
     ctx.push_str("\n=== RECENT EVENTS ===\n\n");

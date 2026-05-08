@@ -9,6 +9,7 @@ mod image_cache;
 mod job_queue;
 mod nostr_client;
 mod nostr_collector;
+mod opengraph;
 mod profile_cache;
 mod search_relay;
 mod video;
@@ -71,11 +72,14 @@ async fn main() -> Result<()> {
 
     let profile_cache = ProfileCache::new(db.clone(), nostr.clone(), 7);
 
+    let og_cache = crate::opengraph::OpenGraphCache::new(2048);
+
     let classifier = Classifier::new(
         &config.llm,
         nostr.clone(),
         profile_cache,
         image_cache.clone(),
+        og_cache,
         db.clone(),
         crate::config::load_label_taxonomy(config.labels.taxonomy_file.as_deref()),
         config.labels.min_score,
@@ -87,7 +91,7 @@ async fn main() -> Result<()> {
         config.labels.min_score
     );
 
-    let job_queue = Arc::new(JobQueue::new(config.processing.max_workers, config.processing.cache_days, std::time::Duration::from_secs(config.processing.job_timeout_secs)));
+    let job_queue = Arc::new(JobQueue::new(config.processing.max_workers, config.processing.max_retries, config.processing.cache_days, std::time::Duration::from_secs(config.processing.job_timeout_secs)));
     tracing::info!("Job queue initialized with {} workers", config.processing.max_workers);
 
     // Build the search relay backed by our FTS index
@@ -117,7 +121,7 @@ async fn main() -> Result<()> {
             tracing::info!("Found {} unclassified profiles, enqueuing...", unclassified.len());
             let mut queued = 0usize;
             for pubkey in &unclassified {
-                if job_queue.enqueue(Job { pubkey: pubkey.clone() }).await? {
+                if job_queue.enqueue(Job { pubkey: pubkey.clone(), retry_count: 0 }).await? {
                     queued += 1;
                 }
             }

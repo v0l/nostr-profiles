@@ -150,7 +150,7 @@ impl NostrCollector {
                 };
 
                 if meets_threshold {
-                    let job = Job { pubkey: pubkey.clone() };
+                    let job = Job { pubkey: pubkey.clone(), retry_count: 0 };
                     if job_queue.enqueue(job).await.unwrap_or(false) {
                         tracing::info!(
                             "Queued profile {} for processing ({} events)",

@@ -2,6 +2,7 @@ use crate::config::LlmConfig;
 use crate::db::Database;
 use crate::image_cache::ImageCache;
 use crate::nostr_client::NostrClient;
+use crate::opengraph::OpenGraphCache;
 use crate::profile_cache::ProfileCache;
 use anyhow::{bail, Result};
 use nostr_sdk::JsonUtil;
@@ -43,6 +44,7 @@ pub struct Classifier {
     nostr: NostrClient,
     profile_cache: ProfileCache,
     image_cache: ImageCache,
+    og_cache: OpenGraphCache,
     db: Arc<Database>,
     label_taxonomy: Vec<String>,
     label_min_score: f64,
@@ -55,7 +57,7 @@ impl Classifier {
         &self.profile_cache
     }
 
-    pub fn new(config: &LlmConfig, nostr: NostrClient, profile_cache: ProfileCache, image_cache: ImageCache, db: Arc<Database>, label_taxonomy: Vec<String>, label_min_score: f64, tool_call_timeout: Duration) -> Self {
+    pub fn new(config: &LlmConfig, nostr: NostrClient, profile_cache: ProfileCache, image_cache: ImageCache, og_cache: OpenGraphCache, db: Arc<Database>, label_taxonomy: Vec<String>, label_min_score: f64, tool_call_timeout: Duration) -> Self {
         let openai_config = OpenAIConfig::new()
             .with_api_base(&config.api_base_url)
             .with_api_key(&config.api_key);
@@ -76,6 +78,7 @@ impl Classifier {
             nostr,
             profile_cache,
             image_cache,
+            og_cache,
             db,
             label_taxonomy,
             label_min_score,
@@ -167,6 +170,23 @@ impl Classifier {
                             }
                         },
                         "required": ["uri"]
+                    })),
+                    strict: None,
+                },
+            }),
+            ChatCompletionTools::Function(ChatCompletionTool {
+                function: FunctionObject {
+                    name: "get_opengraph".to_string(),
+                    description: Some("Fetch OpenGraph metadata for a URL found in a post. Returns the page title, description, site name, type, and image URL. This reveals what a shared link is about — for example, a URL shared in a post might link to a political news article, a tech blog, or a product page. ALWAYS call this for any non-nostr, non-image URL you see in event content — you cannot determine what a link contains from its URL alone. Do NOT call this for nostr: URIs (use resolve_nip21 instead) or image/video URLs (use describe_image instead).".to_string()),
+                    parameters: Some(serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "url": {
+                                "type": "string",
+                                "description": "The HTTPS URL to fetch OpenGraph metadata for"
+                            }
+                        },
+                        "required": ["url"]
                     })),
                     strict: None,
                 },
@@ -590,6 +610,18 @@ impl Classifier {
                     Err(e) => Ok(format!("Invalid NIP-21 URI '{}': {}", uri, e)),
                 }
             }
+            "get_opengraph" => {
+                let args: serde_json::Value = serde_json::from_str(arguments)
+                    .map_err(|e| anyhow::anyhow!("Invalid JSON arguments: {}", e))?;
+                let url = args.get("url")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow::anyhow!("Missing url"))?;
+
+                match self.og_cache.get_preview(url).await {
+                    Some(data) => Ok(crate::format::describe_opengraph(&data)),
+                    None => Ok(format!("No OpenGraph data found for: {}", url)),
+                }
+            }
             _ => Err(anyhow::anyhow!("Unknown tool: {}", name)),
         }
     }
@@ -728,6 +760,9 @@ IMPORTANT: Before scoring, call the appropriate tools for every reference you en
 2. Call resolve_nip21 for every nostr: URI in event content (e.g. nostr:npub1..., nostr:nevent1..., nostr:naddr1...).
    These are explicit references to other entities — understanding what they point to is critical for classification.
    Do NOT skip them or guess what they reference from the URI string alone.
+3. Call get_opengraph for every non-nostr, non-image HTTPS URL in event content.
+   Shared links reveal interests — someone linking to a political news article is interested in politics, someone linking to a GitHub repo is interested in software development.
+   Do NOT call get_opengraph for nostr: URIs (use resolve_nip21) or image/video URLs (use describe_image).
 
 LABEL TAXONOMY (score each one):
 {label_list}

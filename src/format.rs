@@ -1,4 +1,5 @@
 use crate::db::Profile;
+use crate::opengraph::OpenGraphData;
 
 /// Human-readable names for common Nostr event kinds.
 pub fn kind_name(kind: u16) -> &'static str {
@@ -50,6 +51,32 @@ pub fn describe_event(event: &nostr_sdk::Event) -> String {
     s.push_str(&format!("Created: {}\n", event.created_at.as_secs()));
     let tags = serde_json::to_string(&event.tags).unwrap_or_default();
     s.push_str(&format!("Tags: {}\n", tags));
+    s
+}
+
+pub fn describe_opengraph(data: &OpenGraphData) -> String {
+    let mut s = String::new();
+    if let Some(title) = &data.title {
+        s.push_str(&format!("Title: {}\n", title));
+    }
+    if let Some(desc) = &data.description {
+        s.push_str(&format!("Description: {}\n", desc));
+    }
+    if let Some(site) = &data.site_name {
+        s.push_str(&format!("Site: {}\n", site));
+    }
+    if let Some(type_name) = &data.type_name {
+        s.push_str(&format!("Type: {}\n", type_name));
+    }
+    if let Some(url) = &data.url {
+        s.push_str(&format!("URL: {}\n", url));
+    }
+    if let Some(image) = &data.image {
+        s.push_str(&format!("Image: {}\n", image));
+    }
+    if s.is_empty() {
+        s.push_str("(no OpenGraph data)\n");
+    }
     s
 }
 
