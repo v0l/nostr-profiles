@@ -21,6 +21,8 @@ use sqlx::{FromRow, SqlitePool};
 /// - 9735:   Zap Receipt — NIP-57
 /// - 9802:   Highlights — NIP-84
 /// - 30023:  Long-form Content — NIP-23
+/// - 34235:  Addressable Normal Video — NIP-71
+/// - 34236:  Addressable Short Video — NIP-71
 pub const CLASSIFIABLE_KINDS: &[u16] = &[
     0,      // Metadata
     1,      // Short Text Note
@@ -35,6 +37,8 @@ pub const CLASSIFIABLE_KINDS: &[u16] = &[
     9735,   // Zap Receipt
     9802,   // Highlights
     30023,  // Long-form Content
+    34235,  // Addressable Normal Video
+    34236,  // Addressable Short Video
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
@@ -84,6 +88,14 @@ pub struct Classification {
     pub scores: std::collections::HashMap<String, f64>,
     pub bio: String,
     pub confidence: f64,
+    pub kind_breakdown: Vec<KindCount>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KindCount {
+    pub kind: i64,
+    pub name: String,
+    pub count: i64,
 }
 
 #[derive(Clone, Debug)]
@@ -596,17 +608,19 @@ impl Database {
     ) -> Result<()> {
         let labels = serde_json::to_string(&classification.labels)?;
         let scores = serde_json::to_string(&classification.scores)?;
+        let kind_breakdown = serde_json::to_string(&classification.kind_breakdown)?;
 
         sqlx::query(
             r#"
-            INSERT INTO classifications (pubkey, labels, scores, bio, confidence, analyzed_event_count)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO classifications (pubkey, labels, scores, bio, confidence, analyzed_event_count, kind_breakdown)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(pubkey) DO UPDATE SET
                 labels = excluded.labels,
                 scores = excluded.scores,
                 bio = excluded.bio,
                 confidence = excluded.confidence,
                 analyzed_event_count = excluded.analyzed_event_count,
+                kind_breakdown = excluded.kind_breakdown,
                 analyzed_at = CURRENT_TIMESTAMP
             "#,
         )
@@ -616,6 +630,7 @@ impl Database {
         .bind(&classification.bio)
         .bind(classification.confidence)
         .bind(event_count as i64)
+        .bind(&kind_breakdown)
         .execute(&self.pool)
         .await?;
 
@@ -678,8 +693,8 @@ impl Database {
     }
 
     pub async fn get_classification(&self, pubkey: &str) -> Result<Classification> {
-        let (labels, scores, bio, confidence) = sqlx::query_as::<_, (String, String, String, f64)>(
-            r#"SELECT labels, scores, bio, confidence FROM classifications WHERE pubkey = ?"#,
+        let (labels, scores, bio, confidence, kind_breakdown) = sqlx::query_as::<_, (String, String, String, f64, String)>(
+            r#"SELECT labels, scores, bio, confidence, kind_breakdown FROM classifications WHERE pubkey = ?"#,
         )
         .bind(pubkey)
         .fetch_one(&self.pool)
@@ -689,35 +704,41 @@ impl Database {
             .map_err(|e| anyhow::anyhow!("Failed to parse labels: {}", e))?;
         let scores: std::collections::HashMap<String, f64> = serde_json::from_str(&scores)
             .map_err(|e| anyhow::anyhow!("Failed to parse scores: {}", e))?;
+        let kind_breakdown: Vec<KindCount> = serde_json::from_str(&kind_breakdown)
+            .unwrap_or_default();
 
         Ok(Classification {
             labels,
             scores,
             bio,
             confidence,
+            kind_breakdown,
         })
     }
 
     pub async fn get_classification_if_exists(&self, pubkey: &str) -> Result<Option<Classification>> {
-        let result = sqlx::query_as::<_, (String, String, String, f64)>(
-            r#"SELECT labels, scores, bio, confidence FROM classifications WHERE pubkey = ?"#,
+        let result = sqlx::query_as::<_, (String, String, String, f64, String)>(
+            r#"SELECT labels, scores, bio, confidence, kind_breakdown FROM classifications WHERE pubkey = ?"#,
         )
         .bind(pubkey)
         .fetch_optional(&self.pool)
         .await?;
 
         match result {
-            Some((labels, scores, bio, confidence)) => {
+            Some((labels, scores, bio, confidence, kind_breakdown)) => {
                 let labels: Vec<String> = serde_json::from_str(&labels)
                     .map_err(|e| anyhow::anyhow!("Failed to parse labels: {}", e))?;
                 let scores: std::collections::HashMap<String, f64> = serde_json::from_str(&scores)
                     .map_err(|e| anyhow::anyhow!("Failed to parse scores: {}", e))?;
+                let kind_breakdown: Vec<KindCount> = serde_json::from_str(&kind_breakdown)
+                    .unwrap_or_default();
 
                 Ok(Some(Classification {
                     labels,
                     scores,
                     bio,
                     confidence,
+                    kind_breakdown,
                 }))
             }
             None => Ok(None),

@@ -41,6 +41,14 @@ struct ClassificationResponse {
     bio: String,
     confidence: f64,
     analyzed_at: Option<String>,
+    kind_breakdown: Vec<KindBreakdown>,
+}
+
+#[derive(Serialize)]
+struct KindBreakdown {
+    kind: i64,
+    name: String,
+    count: i64,
 }
 
 #[derive(Serialize)]
@@ -178,6 +186,11 @@ async fn get_profile(
                 bio: classification.bio,
                 confidence: classification.confidence,
                 analyzed_at,
+                kind_breakdown: classification.kind_breakdown.into_iter().map(|kc| KindBreakdown {
+                    kind: kc.kind,
+                    name: kc.name,
+                    count: kc.count,
+                }).collect(),
             });
         }
     }

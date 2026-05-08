@@ -324,6 +324,51 @@
         .labels-toggle:hover {
             color: #42a5f5;
         }
+        .kind-breakdown {
+            margin-bottom: 16px;
+        }
+        .kind-bar-row {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-bottom: 4px;
+        }
+        .kind-bar-name {
+            width: 160px;
+            font-size: 12px;
+            color: #ccc;
+            text-align: right;
+            flex-shrink: 0;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .kind-bar-track {
+            flex: 1;
+            height: 16px;
+            background: #3a3a3a;
+            border-radius: 4px;
+            overflow: hidden;
+        }
+        .kind-bar-fill {
+            height: 100%;
+            border-radius: 4px;
+            background: #81c784;
+            transition: width 0.4s;
+        }
+        .kind-bar-count {
+            width: 40px;
+            font-size: 11px;
+            color: #888;
+            flex-shrink: 0;
+        }
+        .kind-bar-pct {
+            width: 40px;
+            font-size: 11px;
+            color: #666;
+            flex-shrink: 0;
+            text-align: right;
+        }
     </style>
 
     <script type="importmap">
@@ -374,6 +419,26 @@
             `;
         }
 
+        function KindBreakdown({ breakdown, total }) {
+            if (!breakdown || breakdown.length === 0) return null;
+            const maxCount = breakdown[0]?.count || 1;
+            return html`
+                <div class="kind-breakdown">
+                    <h3 style=${{ color: '#fff', fontSize: '14px', marginBottom: '10px', textTransform: 'uppercase', letterSpacing: '0.5px' }}>Event Kinds</h3>
+                    ${breakdown.map(({ kind, name, count }) => html`
+                        <div class="kind-bar-row" key=${kind}>
+                            <span class="kind-bar-name" title=${`Kind ${kind}`}>${name}</span>
+                            <div class="kind-bar-track">
+                                <div class="kind-bar-fill" style=${{ width: (count / maxCount * 100) + '%' }} />
+                            </div>
+                            <span class="kind-bar-count">${count}</span>
+                            <span class="kind-bar-pct">${(count / total * 100).toFixed(0)}%</span>
+                        </div>
+                    `)}
+                </div>
+            `;
+        }
+
         function ProfileCard({ profile, onSearch }) {
             if (!profile) return null;
             const { name, picture, nip05, pubkey, about, event_count, is_classified, classification } = profile;
@@ -393,6 +458,7 @@
                         <span>${event_count} events</span>
                         <span style=${{ color: is_classified ? '#66bb6a' : '#ef5350' }}>${is_classified ? 'Classified' : 'Not classified'}</span>
                     </div>
+                    ${is_classified && classification && classification.kind_breakdown && classification.kind_breakdown.length > 0 && html`<${KindBreakdown} breakdown=${classification.kind_breakdown} total=${event_count} />`}
                     <div>
                         <h3 style=${{ color: '#fff', fontSize: '14px', marginBottom: '10px', textTransform: 'uppercase', letterSpacing: '0.5px' }}>Classification</h3>
                         ${is_classified && classification ? html`

@@ -745,22 +745,27 @@ Consider all available signals:
 - Mentions (["p", ...] tags): Who do they talk to or about? Frequent mentions of the same pubkey suggest a close social connection.
 - Reactions: What content do they react to? Use get_event to look up the referenced event — this reveals their interests.
 - Reposts: What content do they amplify? This shows what they associate with.
+- Picture posts (kind 20): These are photo-first posts with structured imeta tags listing image URLs. Call describe_image for each image URL to understand the visual content. Someone posting nature photos is interested in nature/photography; someone posting food photos is interested in food/cooking.
+- Video posts (kind 21, 22, 34235, 34236): These are video-first posts with structured imeta tags listing video URLs and thumbnail images. Call describe_image for thumbnail URLs to understand the video content. Someone posting tech tutorials is interested in software development; someone posting travel vlogs is interested in travel.
 - Zaps received: What content earns tips? This shows what the audience values.
 - Zaps sent: Who do they tip? This shows who they support financially.
 - Profile picture and images: Call describe_image for any image URL you see (profile pictures, images in posts). You cannot judge visual content from a URL alone — always call describe_image first.
+- Shared links: Call get_opengraph for HTTPS URLs in posts to understand what they link to.
 - Profile metadata: Name, about section, NIP-05 domain, and picture can all signal identity and interests.
 
 If a PREVIOUS CLASSIFICATION section is present, use it as context — adjust scores based on new activity.
 
 IMPORTANT: Before scoring, call the appropriate tools for every reference you encounter:
-1. Call describe_image for every image URL in the profile data. This includes:
+1. Call describe_image for every image URL in the profile data and media events. This includes:
    - "Profile Image: https://..." lines
+   - "Images: https://..." lines in Picture events (kind 20)
+   - "Thumbnails: https://..." lines in Video events (kind 21/22/34235/34236)
    - Any URLs ending in .jpg, .jpeg, .png, .gif, .webp in event content
    You MUST call describe_image for these URLs — do not skip them or guess what they contain.
 2. Call resolve_nip21 for every nostr: URI in event content (e.g. nostr:npub1..., nostr:nevent1..., nostr:naddr1...).
    These are explicit references to other entities — understanding what they point to is critical for classification.
    Do NOT skip them or guess what they reference from the URI string alone.
-3. Call get_opengraph for every non-nostr, non-image HTTPS URL in event content.
+3. Call get_opengraph for every non-nostr, non-image, non-video HTTPS URL in event content.
    Shared links reveal interests — someone linking to a political news article is interested in politics, someone linking to a GitHub repo is interested in software development.
    Do NOT call get_opengraph for nostr: URIs (use resolve_nip21) or image/video URLs (use describe_image).
 

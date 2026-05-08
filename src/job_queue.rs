@@ -218,11 +218,15 @@ async fn process_job(
         .classify(&context)
         .await?;
 
+    // Compute kind breakdown from the events that were actually analyzed
+    let kind_breakdown = compute_kind_breakdown(&events);
+
     let classification_db = crate::db::Classification {
         labels: classification.labels.clone(),
         scores: classification.scores.clone(),
         bio: classification.bio.clone(),
         confidence: classification.confidence,
+        kind_breakdown,
     };
     db.save_classification(pubkey, &classification_db, events.len())
         .await?;
@@ -304,6 +308,23 @@ pub fn build_context(
     ctx
 }
 
+fn compute_kind_breakdown(events: &[crate::db::Event]) -> Vec<crate::db::KindCount> {
+    let mut counts: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
+    for event in events {
+        *counts.entry(event.kind).or_insert(0) += 1;
+    }
+    let mut result: Vec<crate::db::KindCount> = counts
+        .into_iter()
+        .map(|(kind, count)| crate::db::KindCount {
+            kind,
+            name: crate::format::kind_name(kind as u16).to_string(),
+            count,
+        })
+        .collect();
+    result.sort_by(|a, b| b.count.cmp(&a.count));
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -350,6 +371,7 @@ mod tests {
             scores: vec![("bitcoin".to_string(), 0.9), ("developer".to_string(), 0.7)].into_iter().collect(),
             bio: "A bitcoin developer".to_string(),
             confidence: 0.8,
+            kind_breakdown: vec![],
         };
 
         let ctx = build_context(&None, &events, &Some(prev));

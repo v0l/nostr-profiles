@@ -18,6 +18,8 @@ pub fn kind_name(kind: u16) -> &'static str {
         9735 => "Zap Receipt",
         9802 => "Highlight",
         30023 => "Long-form Content",
+        34235 => "Addressable Normal Video",
+        34236 => "Addressable Short Video",
         _ => "Unknown",
     }
 }
@@ -45,10 +47,120 @@ pub fn describe_event(event: &nostr_sdk::Event) -> String {
     let mut s = String::new();
     s.push_str(&format!("Kind: {} ({})\n", kind, kind_name(kind)));
     s.push_str(&format!("Author: {}\n", event.pubkey.to_hex()));
+
+    // For media events, extract structured metadata from tags
+    let is_media = matches!(kind, 20 | 21 | 22 | 34235 | 34236);
+    if is_media {
+        // Title tag
+        if let Some(title) = event.tags.iter().find_map(|t| {
+            let vals = t.as_slice();
+            if vals.len() >= 2 && vals[0] == "title" { Some(vals[1].as_str()) } else { None }
+        }) {
+            s.push_str(&format!("Title: {}\n", title));
+        }
+
+        // Content warning
+        if let Some(cw) = event.tags.iter().find_map(|t| {
+            let vals = t.as_slice();
+            if vals.len() >= 2 && vals[0] == "content-warning" { Some(vals[1].as_str()) } else { None }
+        }) {
+            s.push_str(&format!("Content Warning: {}\n", cw));
+        }
+
+        // Hashtags
+        let hashtags: Vec<&str> = event.tags.iter().filter_map(|t| {
+            let vals = t.as_slice();
+            if vals.len() >= 2 && vals[0] == "t" { Some(vals[1].as_str()) } else { None }
+        }).collect();
+        if !hashtags.is_empty() {
+            s.push_str(&format!("Hashtags: {}\n", hashtags.join(", ")));
+        }
+
+        // Parse imeta tags — extract image URLs (kind 20) and video URLs (kind 21/22/34235/34236)
+        let mut image_urls: Vec<&str> = Vec::new();
+        let mut video_urls: Vec<&str> = Vec::new();
+        let mut thumbnail_urls: Vec<&str> = Vec::new();
+        let mut alt_texts: Vec<&str> = Vec::new();
+        let mut dimensions: Vec<&str> = Vec::new();
+
+        for tag in event.tags.iter() {
+            let vals = tag.as_slice();
+            if vals.len() >= 2 && vals[0] == "imeta" {
+                let mut url: Option<&str> = None;
+                let mut mime: Option<&str> = None;
+                let mut alt: Option<&str> = None;
+                let mut dim: Option<&str> = None;
+                let mut thumbnails: Vec<&str> = Vec::new();
+
+                for entry in &vals[1..] {
+                    if let Some(u) = entry.strip_prefix("url ") {
+                        url = Some(u);
+                    } else if let Some(m) = entry.strip_prefix("m ") {
+                        mime = Some(m);
+                    } else if let Some(a) = entry.strip_prefix("alt ") {
+                        alt = Some(a);
+                    } else if let Some(d) = entry.strip_prefix("dim ") {
+                        dim = Some(d);
+                    } else if let Some(i) = entry.strip_prefix("image ") {
+                        thumbnails.push(i);
+                    }
+                }
+
+                if let Some(u) = url {
+                    if let Some(m) = mime {
+                        if m.starts_with("video/") || m == "application/x-mpegURL" {
+                            video_urls.push(u);
+                        } else if m.starts_with("image/") {
+                            image_urls.push(u);
+                        } else {
+                            image_urls.push(u);
+                        }
+                    } else {
+                        if crate::video::is_video_url(u) {
+                            video_urls.push(u);
+                        } else {
+                            image_urls.push(u);
+                        }
+                    }
+                }
+
+                for img in thumbnails {
+                    thumbnail_urls.push(img);
+                }
+                if let Some(a) = alt {
+                    alt_texts.push(a);
+                }
+                if let Some(d) = dim {
+                    dimensions.push(d);
+                }
+            }
+        }
+
+        if !image_urls.is_empty() {
+            s.push_str(&format!("Images: {}\n", image_urls.join(", ")));
+        }
+        if !video_urls.is_empty() {
+            s.push_str(&format!("Videos: {}\n", video_urls.join(", ")));
+        }
+        if !thumbnail_urls.is_empty() {
+            s.push_str(&format!("Thumbnails: {}\n", thumbnail_urls.join(", ")));
+        }
+        if !alt_texts.is_empty() {
+            s.push_str(&format!("Alt text: {}\n", alt_texts.join("; ")));
+        }
+        if !dimensions.is_empty() {
+            s.push_str(&format!("Dimensions: {}\n", dimensions.join(", ")));
+        }
+    }
+
     if !event.content.is_empty() {
         s.push_str(&format!("Content: {}\n", event.content));
     }
     s.push_str(&format!("Created: {}\n", event.created_at.as_secs()));
+
+    // For non-media events, dump raw tags as before.
+    // For media events, we already parsed the important tags above,
+    // but still include them for completeness.
     let tags = serde_json::to_string(&event.tags).unwrap_or_default();
     s.push_str(&format!("Tags: {}\n", tags));
     s

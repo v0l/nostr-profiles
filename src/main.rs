@@ -28,7 +28,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 /// Classification epoch. Increment this when the system prompt, taxonomy,
 /// classification flow, or any other factor changes enough that all previously
 /// classified profiles should be re-processed.
-const CLASSIFICATION_EPOCH: u32 = 2;
+const CLASSIFICATION_EPOCH: u32 = 3;
 
 #[tokio::main]
 async fn main() -> Result<()> {
