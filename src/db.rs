@@ -952,29 +952,38 @@ impl Database {
     }
 
     /// Get all stats in a single query.
-    /// Returns (total_profiles, classified_profiles, total_unique_labels, label_counts, images_classified).
+    /// Returns (total_profiles, classified_profiles, total_unique_labels, label_counts, images_classified, total_events).
+    /// Labels are derived from scores keys where score >= label_min_score.
     pub async fn get_stats(&self) -> Result<(i64, i64, i64, Vec<(String, i64)>, i64, i64)> {
-        let (total_profiles, classified_profiles, total_unique_labels, images_classified, total_events): (i64, i64, i64, i64, i64) =
+        let min_score = self.label_min_score;
+        let epoch = crate::CLASSIFICATION_EPOCH as i64;
+        let (total_profiles, classified_profiles, images_classified, total_events): (i64, i64, i64, i64) =
             sqlx::query_as(
                 r#"SELECT
                     (SELECT COUNT(*) FROM profiles),
                     (SELECT COUNT(*) FROM classifications WHERE classification_epoch >= ?),
-                    (SELECT COUNT(DISTINCT value) FROM classifications, json_each(labels)),
                     (SELECT COUNT(*) FROM image_descriptions),
                     (SELECT COUNT(*) FROM events)"#,
             )
-            .bind(crate::CLASSIFICATION_EPOCH as i64)
+            .bind(epoch)
             .fetch_one(&self.pool)
             .await?;
 
+        // Derive label counts from scores — each key in json_each(scores) is a label,
+        // filtered by score >= label_min_score
         let label_counts = sqlx::query_as::<_, (String, i64)>(
-            r#"SELECT value AS label, COUNT(*) AS count
-               FROM classifications, json_each(labels)
-               GROUP BY value
+            r#"SELECT je.key AS label, COUNT(*) AS count
+               FROM classifications, json_each(scores) AS je
+               WHERE je.value >= ? AND classifications.classification_epoch >= ?
+               GROUP BY je.key
                ORDER BY count DESC"#,
         )
+        .bind(min_score)
+        .bind(epoch)
         .fetch_all(&self.pool)
         .await?;
+
+        let total_unique_labels = label_counts.len() as i64;
 
         Ok((total_profiles, classified_profiles, total_unique_labels, label_counts, images_classified, total_events))
     }
