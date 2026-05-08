@@ -103,8 +103,13 @@ pub const BUILTIN_LABEL_TAXONOMY: &[&str] = &[
     "self-hosting",
     "ai-ml",
     "cryptography",
+    "cybersecurity",
     "hardware",
     "3d-printing",
+    "game-development",
+    "data-science",
+    "embedded-systems",
+    "robotics",
 
     // Bitcoin & Crypto
     "bitcoin",
@@ -115,6 +120,7 @@ pub const BUILTIN_LABEL_TAXONOMY: &[&str] = &[
     "altcoin",
     "defi",
     "trading",
+    "nft",
 
     // Privacy & Freedom
     "privacy-advocate",
@@ -122,6 +128,7 @@ pub const BUILTIN_LABEL_TAXONOMY: &[&str] = &[
     "free-speech",
     "cypherpunk",
     "decentralization",
+    "agorism",
 
     // Content Creation
     "writer",
@@ -131,7 +138,9 @@ pub const BUILTIN_LABEL_TAXONOMY: &[&str] = &[
     "artist",
     "photographer",
     "video-creator",
+    "streamer",
     "memer",
+    "newsletter",
 
     // Professional
     "entrepreneur",
@@ -140,6 +149,11 @@ pub const BUILTIN_LABEL_TAXONOMY: &[&str] = &[
     "researcher",
     "consultant",
     "designer",
+    "scientist",
+    "engineer",
+    "doctor",
+    "lawyer",
+    "farmer",
 
     // Lifestyle & Interests
     "gaming",
@@ -177,23 +191,46 @@ pub const BUILTIN_LABEL_TAXONOMY: &[&str] = &[
     "meditation",
     "mental-health",
     "weather",
+    "history",
+    "economics",
+    "psychedelics",
+    "homesteading",
+    "permaculture",
+    "running",
+    "cycling",
+    "climbing",
+    "martial-arts",
+    "aviation",
+    "astronomy",
+    "board-games",
+    "cinema",
+    "tattoos",
+    "foraging",
 
     // Politics & Society
     "libertarian",
     "anarchist",
     "politics",
     "activism",
+    "conspiracy",
     "prepper",
+    "conservatism",
+    "socialism",
+    "nationalism",
+    "anti-authoritarian",
 
     // Community
     "community-builder",
     "event-organizer",
     "moderator",
+    "mutual-aid",
 
     // Content Quality
     "nsfw",
     "bot",
     "spam",
+    "troll",
+    "scam",
 
     // Language
     "english",
