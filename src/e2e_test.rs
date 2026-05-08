@@ -131,20 +131,20 @@ async fn e2e_classify_reaction_infers_interest() -> Result<()> {
         std::time::Duration::from_secs(config.processing.tool_call_timeout_secs),
     );
 
-    let result = classifier.classify(&context).await?;
+    let result = classifier.classify(&alice_pk, &context).await?;
 
     println!("=== Classification ===");
-    println!("Bio: {}", result.bio);
-    println!("Confidence: {:.2}", result.confidence);
-    let mut sorted: Vec<_> = result.scores.iter().collect();
+    println!("Bio: {}", result.classification.bio);
+    println!("Confidence: {:.2}", result.classification.confidence);
+    let mut sorted: Vec<_> = result.classification.scores.iter().collect();
     sorted.sort_by(|a, b| b.1.partial_cmp(a.1).unwrap());
     for (label, score) in sorted.iter().take(10) {
         println!("  {}: {:.2}", label, score);
     }
 
-    let btc = result.scores.get("bitcoin").copied().unwrap_or(0.0);
-    let nostr_e = result.scores.get("nostr-enthusiast").copied().unwrap_or(0.0);
-    let nostr_d = result.scores.get("nostr-developer").copied().unwrap_or(0.0);
+    let btc = result.classification.scores.get("bitcoin").copied().unwrap_or(0.0);
+    let nostr_e = result.classification.scores.get("nostr-enthusiast").copied().unwrap_or(0.0);
+    let nostr_d = result.classification.scores.get("nostr-developer").copied().unwrap_or(0.0);
 
     assert!(
         btc >= 0.3 || nostr_e >= 0.3 || nostr_d >= 0.3,

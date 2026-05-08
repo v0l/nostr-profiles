@@ -219,12 +219,29 @@ async fn process_job(
         if previous_classification.is_some() { " (re-classification)" } else { "" }
     );
 
-    let classification = classifier
-        .classify(&context)
+    let result = classifier
+        .classify(pubkey, &context)
         .await?;
 
-    // Compute kind breakdown from the events that were actually analyzed
-    let kind_breakdown = compute_kind_breakdown(&events);
+    let classification = result.classification;
+
+    // Compute kind breakdown from the initial events plus any additional events
+    // fetched via the get_profile_events tool
+    let mut kind_breakdown = compute_kind_breakdown(&events);
+    for (kind, count) in &result.tool_event_counts {
+        if let Some(existing) = kind_breakdown.iter_mut().find(|kc| kc.kind == *kind) {
+            existing.count += *count as i64;
+        } else {
+            kind_breakdown.push(crate::db::KindCount {
+                kind: *kind,
+                name: crate::format::kind_name(*kind as u16).to_string(),
+                count: *count as i64,
+            });
+        }
+    }
+    kind_breakdown.sort_by(|a, b| b.count.cmp(&a.count));
+
+    let total_analyzed = events.len() as i64 + result.tool_event_counts.values().sum::<usize>() as i64;
 
     let classification_db = crate::db::Classification {
         labels: classification.labels.clone(),
@@ -232,9 +249,9 @@ async fn process_job(
         bio: classification.bio.clone(),
         confidence: classification.confidence,
         kind_breakdown,
-        analyzed_event_count: events.len() as i64,
+        analyzed_event_count: total_analyzed,
     };
-    db.save_classification(pubkey, &classification_db, events.len(), crate::CLASSIFICATION_EPOCH)
+    db.save_classification(pubkey, &classification_db, total_analyzed as usize, crate::CLASSIFICATION_EPOCH)
         .await?;
 
     // Clean up old events now that classification is done

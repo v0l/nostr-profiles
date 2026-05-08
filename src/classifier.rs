@@ -37,6 +37,12 @@ pub struct Classification {
     pub confidence: f64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClassifyResult {
+    pub classification: Classification,
+    pub tool_event_counts: std::collections::HashMap<i64, usize>,
+}
+
 #[derive(Clone)]
 pub struct Classifier {
     client: Client<OpenAIConfig>,
@@ -89,8 +95,9 @@ impl Classifier {
 
     pub async fn classify(
         &self,
+        pubkey: &str,
         context: &str,
-    ) -> Result<Classification> {
+    ) -> Result<ClassifyResult> {
         let prompt = self.build_classification_prompt();
 
         let messages: Vec<ChatCompletionRequestMessage> = vec![
@@ -191,6 +198,35 @@ impl Classifier {
                     strict: None,
                 },
             }),
+            ChatCompletionTools::Function(ChatCompletionTool {
+                function: FunctionObject {
+                    name: "get_profile_events".to_string(),
+                    description: Some("Fetch additional events for the profile being classified, filtered by kind and optional time range. Use this when the initial event batch is dominated by one kind (e.g. mostly zap receipts) and you need more content from other kinds to make an accurate classification. Returns the most recent events matching the criteria.".to_string()),
+                    parameters: Some(serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "kind": {
+                                "type": "integer",
+                                "description": "The Nostr event kind to filter by (e.g. 1 for short text notes, 7 for reactions, 9735 for zap receipts, 30023 for long-form content)"
+                            },
+                            "since": {
+                                "type": "integer",
+                                "description": "Only return events created at or after this Unix timestamp (optional)"
+                            },
+                            "until": {
+                                "type": "integer",
+                                "description": "Only return events created at or before this Unix timestamp (optional)"
+                            },
+                            "limit": {
+                                "type": "integer",
+                                "description": "Maximum number of events to return (default 20, max 50)"
+                            }
+                        },
+                        "required": ["kind"]
+                    })),
+                    strict: None,
+                },
+            }),
         ]);
 
         let request = CreateChatCompletionRequest {
@@ -203,9 +239,10 @@ impl Classifier {
 
         // Handle tool calls with iterative loop, wrapped in an overall timeout
         let classify_timeout = self.classify_timeout;
-        let classification = tokio::time::timeout(
+        let pubkey_owned = pubkey.to_string();
+        let result = tokio::time::timeout(
             classify_timeout,
-            self.call_with_tool_handling(request),
+            self.call_with_tool_handling(request, &pubkey_owned),
         )
         .await
         .map_err(|_| {
@@ -215,11 +252,17 @@ impl Classifier {
             )
         })??;
         
-        Ok(classification)
+        Ok(result)
     }
 
-    async fn call_with_tool_handling(&self, mut request: CreateChatCompletionRequest) -> Result<Classification> {
+    async fn call_with_tool_handling(&self, mut request: CreateChatCompletionRequest, pubkey: &str) -> Result<ClassifyResult> {
         let mut max_iterations = 15;
+        let mut tool_event_counts: std::collections::HashMap<i64, usize> = std::collections::HashMap::new();
+
+        let make_result = |c: Classification, counts: std::collections::HashMap<i64, usize>| ClassifyResult {
+            classification: c,
+            tool_event_counts: counts,
+        };
         
         loop {
             if max_iterations == 0 {
@@ -243,7 +286,7 @@ impl Classifier {
             // If the model is done (Stop) and gave us content, parse it regardless of tool_calls
             if has_content && matches!(choice.finish_reason, Some(async_openai::types::chat::FinishReason::Stop)) {
                 match self.parse_classification(content) {
-                    Ok(c) => return Ok(c),
+                    Ok(c) => return Ok(make_result(c, tool_event_counts)),
                     Err(e) => {
                         tracing::warn!("Failed to parse classification, retrying: {}", e);
                         request.tools = None; // no more tool calls, just fix the JSON
@@ -295,14 +338,19 @@ impl Classifier {
                         }
                     };
                     info!("Tool call: {}({})", name, arguments);
-                    let result = tokio::time::timeout(
+                    let (result, event_info) = tokio::time::timeout(
                         self.tool_call_timeout,
-                        self.call_tool(&name, &arguments),
+                        self.call_tool(&name, &arguments, pubkey),
                     )
                     .await
                     .map_err(|_| anyhow::anyhow!("Tool call '{}' timed out after {}s", name, self.tool_call_timeout.as_secs()))?
                     .map_err(|e| anyhow::anyhow!("Tool call '{}' failed: {}", name, e))?;
                     info!("Tool response: {} -> {:.200}", name, result);
+
+                    // Track additional events fetched via get_profile_events
+                    if let Some((kind, count)) = event_info {
+                        *tool_event_counts.entry(kind).or_insert(0) += count;
+                    }
                     
                     // Add tool response message
                     request.messages.push(ChatCompletionRequestMessage::Tool(
@@ -314,7 +362,7 @@ impl Classifier {
                 }
             } else if has_content {
                 match self.parse_classification(content) {
-                    Ok(c) => return Ok(c),
+                    Ok(c) => return Ok(make_result(c, tool_event_counts)),
                     Err(e) => {
                         tracing::warn!("Failed to parse classification, retrying: {}", e);
                         request.tools = None;
@@ -347,7 +395,7 @@ impl Classifier {
         request.tools = None;
         let response = self.client.chat().create(request.clone()).await?;
         let content = response.choices[0].message.content.as_deref().unwrap_or("");
-        self.parse_classification(content)
+        self.parse_classification(content).map(|c| make_result(c, tool_event_counts))
     }
 
     fn parse_classification(&self, content: &str) -> Result<Classification> {
@@ -454,7 +502,8 @@ impl Classifier {
         bail!("Failed to parse classification from response (first 200 chars): {:.200}", content)
     }
 
-    async fn call_tool(&self, name: &str, arguments: &str) -> Result<String> {
+    /// Returns (response_text, optional (kind, count) for profile event fetches)
+    async fn call_tool(&self, name: &str, arguments: &str, pubkey: &str) -> Result<(String, Option<(i64, usize)>)> {
         match name {
             "get_event" => {
                 let args: serde_json::Value = serde_json::from_str(arguments)
@@ -466,7 +515,7 @@ impl Classifier {
                 // Check DB cache first
                 if let Some(cached) = self.db.get_event(event_id).await? {
                     if let Ok(event) = nostr_sdk::Event::from_json(&cached.raw_json) {
-                        return Ok(crate::format::describe_event(&event));
+                        return Ok((crate::format::describe_event(&event), None));
                     }
                 }
 
@@ -476,9 +525,9 @@ impl Classifier {
                         if let Err(e) = self.db.cache_event(&event).await {
                             tracing::warn!("Failed to cache fetched event {}: {}", event_id, e);
                         }
-                        Ok(crate::format::describe_event(&event))
+                        Ok((crate::format::describe_event(&event), None))
                     }
-                    None => Ok(format!("Event not found: {}", event_id)),
+                    None => Ok((format!("Event not found: {}", event_id), None)),
                 }
             }
             "get_profile" => {
@@ -489,8 +538,8 @@ impl Classifier {
                     .ok_or_else(|| anyhow::anyhow!("Missing pubkey"))?;
 
                 match self.profile_cache.get_profile(pubkey).await? {
-                    Some(profile) => Ok(crate::format::describe_profile(&profile)),
-                    None => Ok(format!("Profile not found: {}", pubkey)),
+                    Some(profile) => Ok((crate::format::describe_profile(&profile), None)),
+                    None => Ok((format!("Profile not found: {}", pubkey), None)),
                 }
             }
             "describe_image" => {
@@ -503,19 +552,19 @@ impl Classifier {
                 match self.image_cache.download(url).await? {
                     Some((path, hash)) => {
                         if !crate::image_cache::is_valid_image_path(&path) {
-                            return Ok("Could not download or decode image (invalid format)".to_string());
+                            return Ok(("Could not download or decode image (invalid format)".to_string(), None));
                         }
                         // Check for cached description
                         match self.db.get_image_description(&hash).await? {
-                            Some(cached) => Ok(cached),
+                            Some(cached) => Ok((cached, None)),
                             None => {
                                 let desc = self.describe_image(&path).await?;
                                 let _ = self.db.save_image_description(&hash, &desc).await;
-                                Ok(desc)
+                                Ok((desc, None))
                             }
                         }
                     }
-                    None => Ok(format!("Could not download image: {}", url)),
+                    None => Ok((format!("Could not download image: {}", url), None)),
                 }
             }
             "resolve_nip21" => {
@@ -530,15 +579,15 @@ impl Classifier {
                         nostr_sdk::nips::nip21::Nip21::Pubkey(pk) => {
                             let pubkey_hex = pk.to_hex();
                             match self.profile_cache.get_profile(&pubkey_hex).await? {
-                                Some(profile) => Ok(crate::format::describe_profile(&profile)),
-                                None => Ok(format!("Profile not found: {}", pubkey_hex)),
+                                Some(profile) => Ok((crate::format::describe_profile(&profile), None)),
+                                None => Ok((format!("Profile not found: {}", pubkey_hex), None)),
                             }
                         }
                         nostr_sdk::nips::nip21::Nip21::Profile(nprofile) => {
                             let pubkey_hex = nprofile.public_key.to_hex();
                             match self.profile_cache.get_profile(&pubkey_hex).await? {
-                                Some(profile) => Ok(crate::format::describe_profile(&profile)),
-                                None => Ok(format!("Profile not found: {}", pubkey_hex)),
+                                Some(profile) => Ok((crate::format::describe_profile(&profile), None)),
+                                None => Ok((format!("Profile not found: {}", pubkey_hex), None)),
                             }
                         }
                         nostr_sdk::nips::nip21::Nip21::EventId(event_id) => {
@@ -546,7 +595,7 @@ impl Classifier {
                             // Check DB cache first
                             if let Some(cached) = self.db.get_event(&event_id_hex).await? {
                                 if let Ok(event) = nostr_sdk::Event::from_json(&cached.raw_json) {
-                                    return Ok(crate::format::describe_event(&event));
+                                    return Ok((crate::format::describe_event(&event), None));
                                 }
                             }
                             // Fetch from relays
@@ -555,9 +604,9 @@ impl Classifier {
                                     if let Err(e) = self.db.cache_event(&event).await {
                                         tracing::warn!("Failed to cache fetched event {}: {}", event_id_hex, e);
                                     }
-                                    Ok(crate::format::describe_event(&event))
+                                    Ok((crate::format::describe_event(&event), None))
                                 }
-                                None => Ok(format!("Event not found: {}", event_id_hex)),
+                                None => Ok((format!("Event not found: {}", event_id_hex), None)),
                             }
                         }
                         nostr_sdk::nips::nip21::Nip21::Event(nevent) => {
@@ -565,7 +614,7 @@ impl Classifier {
                             // Check DB cache first
                             if let Some(cached) = self.db.get_event(&event_id_hex).await? {
                                 if let Ok(event) = nostr_sdk::Event::from_json(&cached.raw_json) {
-                                    return Ok(crate::format::describe_event(&event));
+                                    return Ok((crate::format::describe_event(&event), None));
                                 }
                             }
                             // Fetch from relays
@@ -574,9 +623,9 @@ impl Classifier {
                                     if let Err(e) = self.db.cache_event(&event).await {
                                         tracing::warn!("Failed to cache fetched event {}: {}", event_id_hex, e);
                                     }
-                                    Ok(crate::format::describe_event(&event))
+                                    Ok((crate::format::describe_event(&event), None))
                                 }
-                                None => Ok(format!("Event not found: {}", event_id_hex)),
+                                None => Ok((format!("Event not found: {}", event_id_hex), None)),
                             }
                         }
                         nostr_sdk::nips::nip21::Nip21::Coordinate(naddr) => {
@@ -598,16 +647,16 @@ impl Classifier {
                                         if let Err(e) = self.db.cache_event(&event).await {
                                             tracing::warn!("Failed to cache fetched coordinate event: {}", e);
                                         }
-                                        Ok(crate::format::describe_event(&event))
+                                        Ok((crate::format::describe_event(&event), None))
                                     } else {
-                                        Ok(format!("Addressable event not found: {}:{}", coord.kind, coord.public_key.to_hex()))
+                                        Ok((format!("Addressable event not found: {}:{}", coord.kind, coord.public_key.to_hex()), None))
                                     }
                                 }
-                                Err(e) => Ok(format!("Error fetching addressable event: {}", e)),
+                                Err(e) => Ok((format!("Error fetching addressable event: {}", e), None)),
                             }
                         }
                     },
-                    Err(e) => Ok(format!("Invalid NIP-21 URI '{}': {}", uri, e)),
+                    Err(e) => Ok((format!("Invalid NIP-21 URI '{}': {}", uri, e), None)),
                 }
             }
             "get_opengraph" => {
@@ -618,9 +667,39 @@ impl Classifier {
                     .ok_or_else(|| anyhow::anyhow!("Missing url"))?;
 
                 match self.og_cache.get_preview(url).await {
-                    Some(data) => Ok(crate::format::describe_opengraph(&data)),
-                    None => Ok(format!("No OpenGraph data found for: {}", url)),
+                    Some(data) => Ok((crate::format::describe_opengraph(&data), None)),
+                    None => Ok((format!("No OpenGraph data found for: {}", url), None)),
                 }
+            }
+            "get_profile_events" => {
+                let args: serde_json::Value = serde_json::from_str(arguments)
+                    .map_err(|e| anyhow::anyhow!("Invalid JSON arguments: {}", e))?;
+                let kind = args.get("kind")
+                    .and_then(|v| v.as_i64())
+                    .ok_or_else(|| anyhow::anyhow!("Missing kind"))?;
+                let since = args.get("since").and_then(|v| v.as_i64());
+                let until = args.get("until").and_then(|v| v.as_i64());
+                let limit = args.get("limit")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(20)
+                    .min(50) as usize;
+
+                let events = self.db.get_profile_events_by_kind(pubkey, kind, since, until, limit).await?;
+                let count = events.len();
+                if events.is_empty() {
+                    return Ok((format!("No events found for kind {} for this profile", kind), None));
+                }
+
+                let mut result = String::new();
+                for (i, event) in events.iter().enumerate() {
+                    let Ok(nostr_event) = nostr_sdk::Event::from_json(&event.raw_json) else {
+                        continue;
+                    };
+                    result.push_str(&format!("--- Event {} ---\n", i + 1));
+                    result.push_str(&crate::format::describe_event(&nostr_event));
+                    result.push('\n');
+                }
+                Ok((result, Some((kind, count))))
             }
             _ => Err(anyhow::anyhow!("Unknown tool: {}", name)),
         }

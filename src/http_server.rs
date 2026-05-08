@@ -64,6 +64,7 @@ struct KindBreakdown {
 struct StatsResponse {
     total_profiles: i64,
     classified_profiles: i64,
+    total_events: i64,
     images_classified: i64,
     queue_size: usize,
     labels: LabelStats,
@@ -245,13 +246,14 @@ async fn search(
 }
 
 async fn get_stats(State(state): State<AppState>) -> impl IntoResponse {
-    let (total_profiles, classified_profiles, total_unique_labels, label_counts, images_classified) =
-        state.db.get_stats().await.unwrap_or((0, 0, 0, Vec::new(), 0));
+    let (total_profiles, classified_profiles, total_unique_labels, label_counts, images_classified, total_events) =
+        state.db.get_stats().await.unwrap_or((0, 0, 0, Vec::new(), 0, 0));
     let queue_size = state.job_queue.queue_len().await;
 
     let stats = StatsResponse {
         total_profiles,
         classified_profiles,
+        total_events,
         images_classified,
         queue_size,
         labels: LabelStats {

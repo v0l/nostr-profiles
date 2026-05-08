@@ -17,7 +17,7 @@
             min-height: 100vh;
         }
         .app {
-            max-width: 700px;
+            max-width: 960px;
             margin: 0 auto;
             padding: 20px;
         }
@@ -526,6 +526,10 @@
                     <div class="stat-card">
                         <div class="stat-value green">${stats.classified_profiles.toLocaleString()}</div>
                         <div class="stat-label">Classified</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-value blue">${stats.total_events.toLocaleString()}</div>
+                        <div class="stat-label">Events</div>
                     </div>
                     <div class="stat-card">
                         <div class="stat-value orange">${stats.images_classified.toLocaleString()}</div>

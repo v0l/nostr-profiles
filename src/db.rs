@@ -24,7 +24,6 @@ use sqlx::{FromRow, SqlitePool};
 /// - 34235:  Addressable Normal Video — NIP-71
 /// - 34236:  Addressable Short Video — NIP-71
 pub const CLASSIFIABLE_KINDS: &[u16] = &[
-    0,      // Metadata
     1,      // Short Text Note
     6,      // Repost
     7,      // Reaction
@@ -298,7 +297,9 @@ impl Database {
             .execute(&mut *tx)
             .await?;
 
-            // Kind 0 = metadata — extract profile fields
+            // Kind 0 = metadata — extract profile fields and store in profiles table only.
+            // Metadata events are not inserted into the events table since they are already
+            // represented by the profiles.metadata_json column and provide no classification signal.
             if kind == 0 {
                 let content = &event.content;
                 let meta: nostr_sdk::Metadata = match serde_json::from_str(content) {
@@ -327,6 +328,8 @@ impl Database {
                 .bind(created_at)
                 .execute(&mut *tx)
                 .await?;
+
+                continue; // Don't insert kind:0 into the events table
             }
 
             // Insert event — replaceable/addressable events use coordinate as ID,
@@ -437,9 +440,12 @@ impl Database {
         // Ensure profile exists first (for foreign key constraint)
         self.upsert_profile(&pubkey).await?;
 
-        // Kind 0 = metadata — extract profile fields and update
+        // Kind 0 = metadata — extract profile fields and store in profiles table only.
+        // Metadata events are not inserted into the events table since they are already
+        // represented by the profiles.metadata_json column and provide no classification signal.
         if kind == 0 {
             self.update_profile_metadata(&pubkey, &event.content, &raw_json, created_at).await?;
+            return Ok(());
         }
 
         sqlx::query(
@@ -591,6 +597,32 @@ impl Database {
             query = query.bind(*kind);
         }
         let rows = query.bind(limit as i64).fetch_all(&self.pool).await?;
+
+        Ok(rows)
+    }
+
+    pub async fn get_profile_events_by_kind(
+        &self,
+        pubkey: &str,
+        kind: i64,
+        since: Option<i64>,
+        until: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<Event>> {
+        let mut builder = sqlx::QueryBuilder::new(
+            "SELECT id, pubkey, kind, created_at, raw_json FROM events WHERE pubkey = ? AND kind = ?"
+        );
+        builder.push_bind(pubkey).push_bind(kind);
+
+        if let Some(s) = since {
+            builder.push(" AND created_at >= ").push_bind(s);
+        }
+        if let Some(u) = until {
+            builder.push(" AND created_at <= ").push_bind(u);
+        }
+        builder.push(" ORDER BY created_at DESC LIMIT ").push_bind(limit as i64);
+
+        let rows = builder.build_query_as::<Event>().fetch_all(&self.pool).await?;
 
         Ok(rows)
     }
@@ -920,14 +952,15 @@ impl Database {
 
     /// Get all stats in a single query.
     /// Returns (total_profiles, classified_profiles, total_unique_labels, label_counts, images_classified).
-    pub async fn get_stats(&self) -> Result<(i64, i64, i64, Vec<(String, i64)>, i64)> {
-        let (total_profiles, classified_profiles, total_unique_labels, images_classified): (i64, i64, i64, i64) =
+    pub async fn get_stats(&self) -> Result<(i64, i64, i64, Vec<(String, i64)>, i64, i64)> {
+        let (total_profiles, classified_profiles, total_unique_labels, images_classified, total_events): (i64, i64, i64, i64, i64) =
             sqlx::query_as(
                 r#"SELECT
                     (SELECT COUNT(*) FROM profiles),
                     (SELECT COUNT(*) FROM classifications WHERE classification_epoch >= ?),
                     (SELECT COUNT(DISTINCT value) FROM classifications, json_each(labels)),
-                    (SELECT COUNT(*) FROM image_descriptions)"#,
+                    (SELECT COUNT(*) FROM image_descriptions),
+                    (SELECT COUNT(*) FROM events)"#,
             )
             .bind(crate::CLASSIFICATION_EPOCH as i64)
             .fetch_one(&self.pool)
@@ -942,7 +975,7 @@ impl Database {
         .fetch_all(&self.pool)
         .await?;
 
-        Ok((total_profiles, classified_profiles, total_unique_labels, label_counts, images_classified))
+        Ok((total_profiles, classified_profiles, total_unique_labels, label_counts, images_classified, total_events))
     }
 
     /// Prepare a user query for FTS5: add prefix wildcard to each term.
