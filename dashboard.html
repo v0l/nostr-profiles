@@ -441,7 +441,15 @@
 
         function ProfileCard({ profile, onSearch }) {
             if (!profile) return null;
-            const { name, picture, nip05, pubkey, about, event_count, is_classified, classification } = profile;
+            const { name, picture, nip05, pubkey, about, event_count, classification_status, classification } = profile;
+
+            const statusLabel = classification_status === 'current' ? 'Classified'
+                : classification_status === 'stale' ? `Stale (epoch ${classification_status.epoch})`
+                : 'Not classified';
+            const statusColor = classification_status === 'current' ? '#66bb6a'
+                : classification_status === 'stale' ? '#ffa726'
+                : '#ef5350';
+            const hasClassification = classification_status !== 'none';
 
             return html`
                 <div class="card">
@@ -456,12 +464,12 @@
                     ${about && html`<div class="about">${about}</div>`}
                     <div class="meta">
                         <span>${event_count} events</span>
-                        <span style=${{ color: is_classified ? '#66bb6a' : '#ef5350' }}>${is_classified ? 'Classified' : 'Not classified'}</span>
+                        <span style=${{ color: statusColor }}>${statusLabel}</span>
                     </div>
-                    ${is_classified && classification && classification.kind_breakdown && classification.kind_breakdown.length > 0 && html`<${KindBreakdown} breakdown=${classification.kind_breakdown} total=${event_count} />`}
+                    ${hasClassification && classification && classification.kind_breakdown && classification.kind_breakdown.length > 0 && html`<${KindBreakdown} breakdown=${classification.kind_breakdown} total=${classification.analyzed_event_count} />`}
                     <div>
                         <h3 style=${{ color: '#fff', fontSize: '14px', marginBottom: '10px', textTransform: 'uppercase', letterSpacing: '0.5px' }}>Classification</h3>
-                        ${is_classified && classification ? html`
+                        ${hasClassification && classification ? html`
                             <div class="labels">
                                 ${Object.entries(classification.scores)
                                     .sort((a, b) => b[1] - a[1])
@@ -518,6 +526,10 @@
                     <div class="stat-card">
                         <div class="stat-value green">${stats.classified_profiles.toLocaleString()}</div>
                         <div class="stat-label">Classified</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-value orange">${stats.images_classified.toLocaleString()}</div>
+                        <div class="stat-label">Images</div>
                     </div>
                     <div class="stat-card">
                         <div class="stat-value orange">${stats.queue_size.toLocaleString()}</div>

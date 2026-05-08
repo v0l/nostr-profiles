@@ -106,10 +106,21 @@ impl SearchDatabase {
     /// Construct a kind 0 (Metadata) event for a given pubkey from the profiles table.
     async fn get_metadata_event_for_pubkey(&self, pubkey_hex: &str) -> Option<Event> {
         // Only return classified profiles from the search relay
-        let profile = self.db.get_profile_by_pubkey(pubkey_hex).await.ok()??;
-        if !profile.is_classified {
+        let has_classification: bool = sqlx::query_scalar::<_, i64>(
+            r#"SELECT COUNT(*) FROM classifications WHERE pubkey = ? AND classification_epoch >= ?"#,
+        )
+        .bind(pubkey_hex)
+        .bind(crate::CLASSIFICATION_EPOCH as i64)
+        .fetch_one(&self.db.pool)
+        .await
+        .ok()
+        .map_or(false, |c| c > 0);
+
+        if !has_classification {
             return None;
         }
+
+        let profile = self.db.get_profile_by_pubkey(pubkey_hex).await.ok()??;
 
         // Use the raw kind 0 event stored on the profiles table
         if let Some(ref json) = profile.metadata_json {

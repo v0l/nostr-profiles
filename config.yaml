@@ -19,6 +19,7 @@ nostr:
 
 processing:
   event_threshold: 20
+  classification_event_limit: 50
   cache_days: 7
   max_workers: 4
   max_retries: 3

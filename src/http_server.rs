@@ -23,6 +23,14 @@ pub struct AppState {
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ClassificationStatusResponse {
+    None,
+    Stale { epoch: u32 },
+    Current,
+}
+
+#[derive(Serialize)]
 struct ProfileResponse {
     pubkey: String,
     name: Option<String>,
@@ -30,7 +38,7 @@ struct ProfileResponse {
     picture: Option<String>,
     nip05: Option<String>,
     event_count: usize,
-    is_classified: bool,
+    classification_status: ClassificationStatusResponse,
     metadata_json: Option<String>,
     classification: Option<ClassificationResponse>,
 }
@@ -41,6 +49,7 @@ struct ClassificationResponse {
     bio: String,
     confidence: f64,
     analyzed_at: Option<String>,
+    analyzed_event_count: i64,
     kind_breakdown: Vec<KindBreakdown>,
 }
 
@@ -55,6 +64,7 @@ struct KindBreakdown {
 struct StatsResponse {
     total_profiles: i64,
     classified_profiles: i64,
+    images_classified: i64,
     queue_size: usize,
     labels: LabelStats,
 }
@@ -156,6 +166,15 @@ async fn get_profile(
     // Get event count dynamically
     let event_count = db.get_profile_event_count(pubkey).await.unwrap_or(0);
 
+    // Get classification status
+    let status = db.get_classification_status(pubkey, crate::CLASSIFICATION_EPOCH).await.unwrap_or(crate::db::ClassificationStatus::None);
+
+    let status_response = match &status {
+        crate::db::ClassificationStatus::None => ClassificationStatusResponse::None,
+        crate::db::ClassificationStatus::Stale { epoch } => ClassificationStatusResponse::Stale { epoch: *epoch },
+        crate::db::ClassificationStatus::Current => ClassificationStatusResponse::Current,
+    };
+
     let mut response = ProfileResponse {
         pubkey: profile.pubkey,
         name: profile.name,
@@ -163,13 +182,13 @@ async fn get_profile(
         picture: profile.picture,
         nip05: profile.nip05,
         event_count,
-        is_classified: profile.is_classified,
+        classification_status: status_response,
         metadata_json: profile.metadata_json,
         classification: None,
     };
 
-    // Get classification if exists
-    if profile.is_classified {
+    // Get classification if one exists (even if stale — still useful to show)
+    if !matches!(status, crate::db::ClassificationStatus::None) {
         if let Ok(classification) = db.get_classification(&pubkey).await {
             let analyzed_at = sqlx::query_scalar::<_, Option<chrono::DateTime<chrono::Utc>>>(
                 r#"SELECT analyzed_at FROM classifications WHERE pubkey = ?"#,
@@ -186,6 +205,7 @@ async fn get_profile(
                 bio: classification.bio,
                 confidence: classification.confidence,
                 analyzed_at,
+                analyzed_event_count: classification.analyzed_event_count,
                 kind_breakdown: classification.kind_breakdown.into_iter().map(|kc| KindBreakdown {
                     kind: kc.kind,
                     name: kc.name,
@@ -225,13 +245,14 @@ async fn search(
 }
 
 async fn get_stats(State(state): State<AppState>) -> impl IntoResponse {
-    let (total_profiles, classified_profiles, total_unique_labels, label_counts) =
-        state.db.get_stats().await.unwrap_or((0, 0, 0, Vec::new()));
+    let (total_profiles, classified_profiles, total_unique_labels, label_counts, images_classified) =
+        state.db.get_stats().await.unwrap_or((0, 0, 0, Vec::new(), 0));
     let queue_size = state.job_queue.queue_len().await;
 
     let stats = StatsResponse {
         total_profiles,
         classified_profiles,
+        images_classified,
         queue_size,
         labels: LabelStats {
             total_unique_labels,

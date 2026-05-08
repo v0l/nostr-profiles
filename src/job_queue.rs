@@ -21,6 +21,7 @@ pub struct JobQueue {
     queued_pubkeys: Arc<Mutex<HashSet<String>>>,
     cache_days: u64,
     job_timeout: Duration,
+    classification_event_limit: usize,
 }
 
 impl Clone for JobQueue {
@@ -33,12 +34,13 @@ impl Clone for JobQueue {
             queued_pubkeys: self.queued_pubkeys.clone(),
             cache_days: self.cache_days,
             job_timeout: self.job_timeout,
+            classification_event_limit: self.classification_event_limit,
         }
     }
 }
 
 impl JobQueue {
-    pub fn new(max_workers: usize, max_retries: u8, cache_days: u64, job_timeout: Duration) -> Self {
+    pub fn new(max_workers: usize, max_retries: u8, cache_days: u64, job_timeout: Duration, classification_event_limit: usize) -> Self {
         let (tx, rx) = mpsc::channel(10000);
 
         Self {
@@ -49,6 +51,7 @@ impl JobQueue {
             queued_pubkeys: Arc::new(Mutex::new(HashSet::new())),
             cache_days,
             job_timeout,
+            classification_event_limit,
         }
     }
 
@@ -105,7 +108,7 @@ impl JobQueue {
                     let pubkey = job.pubkey.clone();
                     let result = tokio::time::timeout(
                         job_timeout,
-                        process_job(&job, &db, &classifier, &image_cache, cache_days),
+                        process_job(&job, &db, &classifier, &image_cache, cache_days, queue.classification_event_limit),
                     )
                     .await
                     .map_err(|_| anyhow::anyhow!("Job for profile {} timed out after {}s", pubkey, job_timeout.as_secs()))
@@ -176,6 +179,7 @@ impl JobQueue {
             queued_pubkeys: self.queued_pubkeys.clone(),
             cache_days: self.cache_days,
             job_timeout: self.job_timeout,
+            classification_event_limit: self.classification_event_limit,
         }
     }
 }
@@ -186,11 +190,12 @@ async fn process_job(
     classifier: &Classifier,
     _image_cache: &ImageCache,
     cache_days: u64,
+    classification_event_limit: usize,
 ) -> Result<()> {
     let start = std::time::Instant::now();
     let pubkey = &job.pubkey;
 
-    let events = db.get_profile_events(pubkey, 50).await?;
+    let events = db.get_profile_events(pubkey, classification_event_limit).await?;
 
     // Ensure we have profile metadata — fetch from relays if missing
     if let Err(e) = classifier.profile_cache().ensure_metadata(pubkey).await {
@@ -227,10 +232,10 @@ async fn process_job(
         bio: classification.bio.clone(),
         confidence: classification.confidence,
         kind_breakdown,
+        analyzed_event_count: events.len() as i64,
     };
-    db.save_classification(pubkey, &classification_db, events.len())
+    db.save_classification(pubkey, &classification_db, events.len(), crate::CLASSIFICATION_EPOCH)
         .await?;
-    db.mark_profile_classified(pubkey).await?;
 
     // Clean up old events now that classification is done
     let deleted = db.delete_old_events_for_pubkey(pubkey, cache_days).await?;
@@ -372,6 +377,7 @@ mod tests {
             bio: "A bitcoin developer".to_string(),
             confidence: 0.8,
             kind_breakdown: vec![],
+            analyzed_event_count: 50,
         };
 
         let ctx = build_context(&None, &events, &Some(prev));

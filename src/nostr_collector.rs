@@ -121,7 +121,7 @@ impl NostrCollector {
                 continue;
             }
 
-            let is_classified = match db.get_profile_is_classified(&pubkey).await {
+            let is_current = match db.has_current_classification(&pubkey, crate::CLASSIFICATION_EPOCH).await {
                 Ok(c) => c,
                 Err(e) => {
                     tracing::error!("Failed to check classification status for {}: {}", pubkey, e);
@@ -129,7 +129,7 @@ impl NostrCollector {
                 }
             };
 
-            if is_classified {
+            if is_current {
                 continue;
             }
 

@@ -32,6 +32,8 @@ pub struct NostrConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProcessingConfig {
     pub event_threshold: usize,
+    /// Max number of recent events to feed into the classifier (default: 50)
+    pub classification_event_limit: usize,
     pub cache_days: u64,
     pub max_workers: usize,
     pub max_retries: u8,
@@ -73,6 +75,7 @@ impl Config {
             .set_default("llm.timeout_secs", 120)?
             .set_default("llm.classify_timeout_secs", 300)?
             .set_default("processing.min_followers", 1)?
+            .set_default("processing.classification_event_limit", 50)?
             .set_default("processing.job_timeout_secs", 600)?
             .set_default("processing.tool_call_timeout_secs", 30)?
             .set_default("labels.min_score", 0.4)?

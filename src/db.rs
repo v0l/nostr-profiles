@@ -41,6 +41,17 @@ pub const CLASSIFIABLE_KINDS: &[u16] = &[
     34236,  // Addressable Short Video
 ];
 
+/// Classification status derived from the classifications table.
+#[derive(Debug, Clone)]
+pub enum ClassificationStatus {
+    /// No classification exists at all
+    None,
+    /// Classification exists but is from a stale epoch
+    Stale { epoch: u32 },
+    /// Classification is current
+    Current,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct Profile {
     pub pubkey: String,
@@ -89,6 +100,7 @@ pub struct Classification {
     pub bio: String,
     pub confidence: f64,
     pub kind_breakdown: Vec<KindCount>,
+    pub analyzed_event_count: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -139,6 +151,41 @@ impl Database {
         .await?
         > 0;
 
+        if has_migration_table {
+            // Prod DB may have the old _sqlx_migrations schema with a `type` column
+            // that sqlx 0.8 doesn't include in its INSERT. Detect and fix it.
+            let has_type_column: bool = sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM pragma_table_info('_sqlx_migrations') WHERE name='type'",
+            )
+            .fetch_one(pool)
+            .await?
+            > 0;
+
+            if has_type_column {
+                tracing::info!("Fixing _sqlx_migrations table schema (dropping stray `type` column)");
+                // SQLite doesn't support DROP COLUMN before 3.35.0, and even then
+                // only if it's not referenced. Recreate the table to match sqlx's schema.
+                sqlx::query(
+                    r#"
+                    CREATE TABLE _sqlx_migrations_new (
+                        version BIGINT PRIMARY KEY,
+                        description TEXT NOT NULL,
+                        installed_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        success BOOLEAN NOT NULL,
+                        checksum BLOB NOT NULL,
+                        execution_time BIGINT NOT NULL
+                    );
+                    INSERT INTO _sqlx_migrations_new (version, description, installed_on, success, checksum, execution_time)
+                        SELECT version, description, installed_on, success, checksum, execution_time FROM _sqlx_migrations;
+                    DROP TABLE _sqlx_migrations;
+                    ALTER TABLE _sqlx_migrations_new RENAME TO _sqlx_migrations;
+                    "#,
+                )
+                .execute(pool)
+                .await?;
+            }
+        }
+
         if !has_migration_table {
             // Check if this is a legacy DB (has actual data tables but no migration tracking)
             let has_profiles: bool = sqlx::query_scalar::<_, i64>(
@@ -185,56 +232,18 @@ impl Database {
         Ok(())
     }
 
-    /// Get a value from the kv table.
-    pub async fn get_kv(&self, key: &str) -> Result<Option<String>> {
-        let row = sqlx::query_as::<_, (String,)>(
-            r#"SELECT value FROM kv WHERE key = ?"#,
-        )
-        .bind(key)
-        .fetch_optional(&self.pool)
-        .await?;
-
-        Ok(row.map(|(v,)| v))
-    }
-
-    /// Set a value in the kv table.
-    pub async fn set_kv(&self, key: &str, value: &str) -> Result<()> {
-        sqlx::query(
-            r#"INSERT INTO kv (key, value) VALUES (?, ?)
-               ON CONFLICT(key) DO UPDATE SET value = excluded.value"#,
-        )
-        .bind(key)
-        .bind(value)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    /// Mark all classified profiles as needing re-classification.
-    /// Returns the number of profiles queued for re-processing.
-    pub async fn queue_all_for_reclassification(&self) -> Result<u64> {
-        let result = sqlx::query(
-            r#"UPDATE profiles SET
-                is_classified = FALSE,
-                updated_at = CURRENT_TIMESTAMP
-               WHERE is_classified = TRUE"#,
-        )
-        .execute(&self.pool)
-        .await?;
-
-        Ok(result.rows_affected())
-    }
-
     /// Get pubkeys of profiles that need classification.
-    /// These are profiles with enough classifiable events (>= min_events) that aren't classified.
-    pub async fn get_unclassified_pubkeys(&self, min_events: i64) -> Result<Vec<String>> {
+    /// A profile needs classification if it has enough events and either
+    /// has no classification or its classification_epoch < current_epoch.
+    pub async fn get_profiles_needing_classification(&self, min_events: i64, current_epoch: u32) -> Result<Vec<String>> {
         let kinds: Vec<i64> = CLASSIFIABLE_KINDS.iter().map(|k| *k as i64).collect();
         let placeholders = kinds.iter().map(|_| "?").collect::<Vec<_>>().join(",");
 
         let sql = format!(
             r#"SELECT p.pubkey FROM profiles p
                INNER JOIN events e ON e.pubkey = p.pubkey AND e.kind IN ({})
-               WHERE p.is_classified = FALSE
+               LEFT JOIN classifications c ON c.pubkey = p.pubkey
+               WHERE c.pubkey IS NULL OR c.classification_epoch < ?
                GROUP BY p.pubkey
                HAVING COUNT(*) >= ?"#,
             placeholders
@@ -244,6 +253,7 @@ impl Database {
         for kind in &kinds {
             query = query.bind(*kind);
         }
+        query = query.bind(current_epoch as i64);
         query = query.bind(min_events);
         let rows = query.fetch_all(&self.pool).await?;
 
@@ -394,17 +404,27 @@ impl Database {
         Ok(net_new)
     }
 
-    /// Check if a profile is already classified — lightweight query for the collector.
-    pub async fn get_profile_is_classified(&self, pubkey: &str) -> Result<bool> {
-        let is_classified: bool = sqlx::query_scalar(
-            r#"SELECT is_classified FROM profiles WHERE pubkey = ?"#,
+    /// Get the classification status for a profile.
+    pub async fn get_classification_status(&self, pubkey: &str, current_epoch: u32) -> Result<ClassificationStatus> {
+        let epoch: Option<i64> = sqlx::query_scalar(
+            r#"SELECT classification_epoch FROM classifications WHERE pubkey = ?"#,
         )
         .bind(pubkey)
-        .fetch_one(&self.pool)
-        .await
-        .unwrap_or(false);
+        .fetch_optional(&self.pool)
+        .await?;
 
-        Ok(is_classified)
+        Ok(match epoch {
+            None => ClassificationStatus::None,
+            Some(e) if (e as u32) < current_epoch => ClassificationStatus::Stale { epoch: e as u32 },
+            Some(_) => ClassificationStatus::Current,
+        })
+    }
+
+    /// Check if a profile has a current-epoch classification.
+    /// Returns true if the profile has a classification with epoch >= current_epoch.
+    pub async fn has_current_classification(&self, pubkey: &str, current_epoch: u32) -> Result<bool> {
+        let status = self.get_classification_status(pubkey, current_epoch).await?;
+        Ok(matches!(status, ClassificationStatus::Current))
     }
 
     pub async fn cache_event(&self, event: &nostr_sdk::Event) -> Result<()> {
@@ -613,6 +633,7 @@ impl Database {
         pubkey: &str,
         classification: &Classification,
         event_count: usize,
+        epoch: u32,
     ) -> Result<()> {
         let labels = serde_json::to_string(&classification.labels)?;
         let scores = serde_json::to_string(&classification.scores)?;
@@ -620,8 +641,8 @@ impl Database {
 
         sqlx::query(
             r#"
-            INSERT INTO classifications (pubkey, labels, scores, bio, confidence, analyzed_event_count, kind_breakdown)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO classifications (pubkey, labels, scores, bio, confidence, analyzed_event_count, kind_breakdown, classification_epoch)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(pubkey) DO UPDATE SET
                 labels = excluded.labels,
                 scores = excluded.scores,
@@ -629,6 +650,7 @@ impl Database {
                 confidence = excluded.confidence,
                 analyzed_event_count = excluded.analyzed_event_count,
                 kind_breakdown = excluded.kind_breakdown,
+                classification_epoch = excluded.classification_epoch,
                 analyzed_at = CURRENT_TIMESTAMP
             "#,
         )
@@ -639,6 +661,7 @@ impl Database {
         .bind(classification.confidence)
         .bind(event_count as i64)
         .bind(&kind_breakdown)
+        .bind(epoch as i64)
         .execute(&self.pool)
         .await?;
 
@@ -684,25 +707,9 @@ impl Database {
         Ok(())
     }
 
-    pub async fn mark_profile_classified(&self, pubkey: &str) -> Result<()> {
-        sqlx::query(
-            r#"
-            UPDATE profiles 
-            SET is_classified = TRUE,
-                updated_at = CURRENT_TIMESTAMP
-            WHERE pubkey = ?
-            "#,
-        )
-        .bind(pubkey)
-        .execute(&self.pool)
-        .await?;
-
-        Ok(())
-    }
-
     pub async fn get_classification(&self, pubkey: &str) -> Result<Classification> {
-        let (labels, scores, bio, confidence, kind_breakdown) = sqlx::query_as::<_, (String, String, String, f64, String)>(
-            r#"SELECT labels, scores, bio, confidence, kind_breakdown FROM classifications WHERE pubkey = ?"#,
+        let (labels, scores, bio, confidence, kind_breakdown, analyzed_event_count) = sqlx::query_as::<_, (String, String, String, f64, String, i64)>(
+            r#"SELECT labels, scores, bio, confidence, kind_breakdown, analyzed_event_count FROM classifications WHERE pubkey = ?"#,
         )
         .bind(pubkey)
         .fetch_one(&self.pool)
@@ -721,19 +728,20 @@ impl Database {
             bio,
             confidence,
             kind_breakdown,
+            analyzed_event_count,
         })
     }
 
     pub async fn get_classification_if_exists(&self, pubkey: &str) -> Result<Option<Classification>> {
-        let result = sqlx::query_as::<_, (String, String, String, f64, String)>(
-            r#"SELECT labels, scores, bio, confidence, kind_breakdown FROM classifications WHERE pubkey = ?"#,
+        let result = sqlx::query_as::<_, (String, String, String, f64, String, i64)>(
+            r#"SELECT labels, scores, bio, confidence, kind_breakdown, analyzed_event_count FROM classifications WHERE pubkey = ?"#,
         )
         .bind(pubkey)
         .fetch_optional(&self.pool)
         .await?;
 
         match result {
-            Some((labels, scores, bio, confidence, kind_breakdown)) => {
+            Some((labels, scores, bio, confidence, kind_breakdown, analyzed_event_count)) => {
                 let labels: Vec<String> = serde_json::from_str(&labels)
                     .map_err(|e| anyhow::anyhow!("Failed to parse labels: {}", e))?;
                 let scores: std::collections::HashMap<String, f64> = serde_json::from_str(&scores)
@@ -747,6 +755,7 @@ impl Database {
                     bio,
                     confidence,
                     kind_breakdown,
+                    analyzed_event_count,
                 }))
             }
             None => Ok(None),
@@ -910,15 +919,17 @@ impl Database {
     }
 
     /// Get all stats in a single query.
-    /// Returns (total_profiles, classified_profiles, total_unique_labels, label_counts).
-    pub async fn get_stats(&self) -> Result<(i64, i64, i64, Vec<(String, i64)>)> {
-        let (total_profiles, classified_profiles, total_unique_labels): (i64, i64, i64) =
+    /// Returns (total_profiles, classified_profiles, total_unique_labels, label_counts, images_classified).
+    pub async fn get_stats(&self) -> Result<(i64, i64, i64, Vec<(String, i64)>, i64)> {
+        let (total_profiles, classified_profiles, total_unique_labels, images_classified): (i64, i64, i64, i64) =
             sqlx::query_as(
                 r#"SELECT
                     (SELECT COUNT(*) FROM profiles),
-                    (SELECT COUNT(*) FROM profiles WHERE is_classified = TRUE),
-                    (SELECT COUNT(DISTINCT value) FROM classifications, json_each(labels))"#,
+                    (SELECT COUNT(*) FROM classifications WHERE classification_epoch >= ?),
+                    (SELECT COUNT(DISTINCT value) FROM classifications, json_each(labels)),
+                    (SELECT COUNT(*) FROM image_descriptions)"#,
             )
+            .bind(crate::CLASSIFICATION_EPOCH as i64)
             .fetch_one(&self.pool)
             .await?;
 
@@ -931,7 +942,7 @@ impl Database {
         .fetch_all(&self.pool)
         .await?;
 
-        Ok((total_profiles, classified_profiles, total_unique_labels, label_counts))
+        Ok((total_profiles, classified_profiles, total_unique_labels, label_counts, images_classified))
     }
 
     /// Prepare a user query for FTS5: add prefix wildcard to each term.

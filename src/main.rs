@@ -28,7 +28,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 /// Classification epoch. Increment this when the system prompt, taxonomy,
 /// classification flow, or any other factor changes enough that all previously
 /// classified profiles should be re-processed.
-const CLASSIFICATION_EPOCH: u32 = 3;
+pub const CLASSIFICATION_EPOCH: u32 = 3;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -50,18 +50,6 @@ async fn main() -> Result<()> {
 
     let db = Arc::new(Database::new(&config.database.path).await?);
     tracing::info!("Database initialized at {}", config.database.path);
-
-    // Check classification epoch — if bumped, re-classify all profiles
-    let stored_epoch: u32 = db.get_kv("epoch").await?.and_then(|v| v.parse().ok()).unwrap_or(0);
-    if CLASSIFICATION_EPOCH > stored_epoch {
-        tracing::info!(
-            "Classification epoch changed: {} -> {}, queuing all profiles for re-classification",
-            stored_epoch, CLASSIFICATION_EPOCH
-        );
-        let count = db.queue_all_for_reclassification().await?;
-        tracing::info!("Queued {} profiles for re-classification", count);
-        db.set_kv("epoch", &CLASSIFICATION_EPOCH.to_string()).await?;
-    }
 
     let nostr = NostrClient::new(&config.nostr.relays, config.nostr.nsec.as_deref()).await?;
     nostr.connect().await;
@@ -91,7 +79,7 @@ async fn main() -> Result<()> {
         config.labels.min_score
     );
 
-    let job_queue = Arc::new(JobQueue::new(config.processing.max_workers, config.processing.max_retries, config.processing.cache_days, std::time::Duration::from_secs(config.processing.job_timeout_secs)));
+    let job_queue = Arc::new(JobQueue::new(config.processing.max_workers, config.processing.max_retries, config.processing.cache_days, std::time::Duration::from_secs(config.processing.job_timeout_secs), config.processing.classification_event_limit));
     tracing::info!("Job queue initialized with {} workers", config.processing.max_workers);
 
     // Build the search relay backed by our FTS index
@@ -114,11 +102,11 @@ async fn main() -> Result<()> {
         job_queue_clone.run(db_clone, classifier_clone, image_cache_clone).await;
     });
 
-    // Enqueue unclassified profiles on startup
+    // Enqueue profiles that need classification (new or stale epoch)
     {
-        let unclassified = db.get_unclassified_pubkeys(config.processing.event_threshold as i64).await?;
+        let unclassified = db.get_profiles_needing_classification(config.processing.event_threshold as i64, CLASSIFICATION_EPOCH).await?;
         if !unclassified.is_empty() {
-            tracing::info!("Found {} unclassified profiles, enqueuing...", unclassified.len());
+            tracing::info!("Found {} profiles needing classification, enqueuing...", unclassified.len());
             let mut queued = 0usize;
             for pubkey in &unclassified {
                 if job_queue.enqueue(Job { pubkey: pubkey.clone(), retry_count: 0 }).await? {
