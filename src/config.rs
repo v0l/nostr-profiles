@@ -194,6 +194,25 @@ pub const BUILTIN_LABEL_TAXONOMY: &[&str] = &[
     "nsfw",
     "bot",
     "spam",
+
+    // Language
+    "english",
+    "japanese",
+    "chinese",
+    "korean",
+    "german",
+    "french",
+    "spanish",
+    "portuguese",
+    "italian",
+    "russian",
+    "dutch",
+    "turkish",
+    "arabic",
+    "thai",
+    "vietnamese",
+    "indonesian",
+    "hindi",
 ];
 
 /// Load the label taxonomy. If `taxonomy_file` is set, read labels from that file

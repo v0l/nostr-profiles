@@ -40,7 +40,7 @@ async fn e2e_classify_reaction_infers_interest() -> Result<()> {
     let config = Config::load("config.yaml")?;
 
     let db_dir = tempfile::tempdir()?;
-    let db = Arc::new(Database::new(db_dir.path().join("test.db").to_str().unwrap()).await?);
+    let db = Arc::new(Database::new(db_dir.path().join("test.db").to_str().unwrap(), config.labels.min_score).await?);
 
     let alice = nostr_sdk::Keys::generate();
     let bob = nostr_sdk::Keys::generate();
@@ -158,7 +158,7 @@ async fn e2e_classify_reaction_infers_interest() -> Result<()> {
 #[tokio::test]
 async fn test_reaction_references_cached_event() -> Result<()> {
     let db_dir = tempfile::tempdir()?;
-    let db = Database::new(db_dir.path().join("test.db").to_str().unwrap()).await?;
+    let db = Database::new(db_dir.path().join("test.db").to_str().unwrap(), 0.4).await?;
 
     let alice = nostr_sdk::Keys::generate();
     let bob = nostr_sdk::Keys::generate();

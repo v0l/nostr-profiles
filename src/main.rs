@@ -28,7 +28,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 /// Classification epoch. Increment this when the system prompt, taxonomy,
 /// classification flow, or any other factor changes enough that all previously
 /// classified profiles should be re-processed.
-pub const CLASSIFICATION_EPOCH: u32 = 3;
+pub const CLASSIFICATION_EPOCH: u32 = 4;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -48,7 +48,7 @@ async fn main() -> Result<()> {
 
     tracing::info!("Starting Nostr Profile Classifier");
 
-    let db = Arc::new(Database::new(&config.database.path).await?);
+    let db = Arc::new(Database::new(&config.database.path, config.labels.min_score).await?);
     tracing::info!("Database initialized at {}", config.database.path);
 
     let nostr = NostrClient::new(&config.nostr.relays, config.nostr.nsec.as_deref()).await?;

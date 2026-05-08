@@ -4,7 +4,7 @@ use crate::image_cache::ImageCache;
 use crate::nostr_client::NostrClient;
 use crate::opengraph::OpenGraphCache;
 use crate::profile_cache::ProfileCache;
-use anyhow::{bail, Result};
+use thiserror::Error;
 use nostr_sdk::JsonUtil;
 use async_openai::{
     config::OpenAIConfig,
@@ -28,6 +28,61 @@ use async_openai::types::chat::{
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::info;
+
+#[derive(Debug, Error)]
+pub enum ClassifierError {
+    #[error("LLM API error: {0}")]
+    Llm(#[from] async_openai::error::OpenAIError),
+    #[error("Classification timed out after {0}s")]
+    Timeout(u64),
+    #[error("Tool call '{tool}' timed out after {timeout}s")]
+    ToolTimeout { tool: String, timeout: u64 },
+    #[error("Tool call '{tool}' failed: {source}")]
+    ToolFailed { tool: String, #[source] source: Box<dyn std::error::Error + Send + Sync> },
+    #[error("Invalid tool arguments: {0}")]
+    InvalidToolArgs(String),
+    #[error("Unknown tool: {0}")]
+    UnknownTool(String),
+    #[error("Parse error: {0}")]
+    Parse(String),
+    #[error("Database error: {0}")]
+    Database(#[from] sqlx::Error),
+    #[error("Image error: {0}")]
+    Image(String),
+    #[error("Nostr error: {0}")]
+    Nostr(#[from] nostr_sdk::client::Error),
+    #[error("{0}")]
+    Other(String),
+}
+
+impl From<anyhow::Error> for ClassifierError {
+    fn from(e: anyhow::Error) -> Self {
+        ClassifierError::Other(e.to_string())
+    }
+}
+
+impl ClassifierError {
+    /// Returns true if this error is caused by an LLM server error (HTTP 5xx,
+    /// connection failure, or timeout) that should trigger backoff.
+    pub fn is_server_error(&self) -> bool {
+        match self {
+            ClassifierError::Llm(openai_err) => {
+                match openai_err {
+                    async_openai::error::OpenAIError::ApiError(_) => true,
+                    async_openai::error::OpenAIError::Reqwest(req_err) => {
+                        req_err.status().map_or(false, |s| s.is_server_error())
+                            || req_err.is_connect()
+                            || req_err.is_timeout()
+                    }
+                    _ => false,
+                }
+            }
+            ClassifierError::Timeout(_) => true,
+            ClassifierError::ToolTimeout { .. } => true,
+            _ => false,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Classification {
@@ -97,7 +152,7 @@ impl Classifier {
         &self,
         pubkey: &str,
         context: &str,
-    ) -> Result<ClassifyResult> {
+    ) -> Result<ClassifyResult, ClassifierError> {
         let prompt = self.build_classification_prompt();
 
         let messages: Vec<ChatCompletionRequestMessage> = vec![
@@ -246,8 +301,7 @@ impl Classifier {
         )
         .await
         .map_err(|_| {
-            anyhow::anyhow!(
-                "Classification timed out after {}s",
+            ClassifierError::Timeout(
                 classify_timeout.as_secs()
             )
         })??;
@@ -255,7 +309,7 @@ impl Classifier {
         Ok(result)
     }
 
-    async fn call_with_tool_handling(&self, mut request: CreateChatCompletionRequest, pubkey: &str) -> Result<ClassifyResult> {
+    async fn call_with_tool_handling(&self, mut request: CreateChatCompletionRequest, pubkey: &str) -> Result<ClassifyResult, ClassifierError> {
         let mut max_iterations = 15;
         let mut tool_event_counts: std::collections::HashMap<i64, usize> = std::collections::HashMap::new();
 
@@ -343,8 +397,8 @@ impl Classifier {
                         self.call_tool(&name, &arguments, pubkey),
                     )
                     .await
-                    .map_err(|_| anyhow::anyhow!("Tool call '{}' timed out after {}s", name, self.tool_call_timeout.as_secs()))?
-                    .map_err(|e| anyhow::anyhow!("Tool call '{}' failed: {}", name, e))?;
+                    .map_err(|_| ClassifierError::ToolTimeout { tool: name.clone(), timeout: self.tool_call_timeout.as_secs() })?
+                    .map_err(|e| ClassifierError::ToolFailed { tool: name.clone(), source: Box::new(e) })?;
                     info!("Tool response: {} -> {:.200}", name, result);
 
                     // Track additional events fetched via get_profile_events
@@ -398,14 +452,15 @@ impl Classifier {
         self.parse_classification(content).map(|c| make_result(c, tool_event_counts))
     }
 
-    fn parse_classification(&self, content: &str) -> Result<Classification> {
+    fn parse_classification(&self, content: &str) -> Result<Classification, ClassifierError> {
         let content = content.trim();
         
         if content.is_empty() {
-            bail!("LLM returned empty response");
+            return Err(ClassifierError::Parse("LLM returned empty response".to_string()));
         }
 
         // Helper: try to parse the raw JSON and convert scores → labels
+        let valid_labels: std::collections::HashSet<&str> = self.label_taxonomy.iter().map(|s| s.as_str()).collect();
         let try_parse = |json_str: &str| -> Option<Classification> {
             // First try the new scores format
             if let Ok(raw) = serde_json::from_str::<serde_json::Value>(json_str) {
@@ -413,20 +468,21 @@ impl Classifier {
                     let bio = raw.get("bio").and_then(|v| v.as_str()).unwrap_or("").to_string();
                     let confidence = raw.get("confidence").and_then(|v| v.as_f64()).unwrap_or(0.5);
                     
-                    // Build the full scores map
+                    // Build the full scores map — only include labels that are in the taxonomy
                     let mut scores: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
                     for (label, score) in scores_map.iter() {
                         if let Some(s) = score.as_f64() {
-                            scores.insert(label.clone(), s);
+                            if valid_labels.contains(label.as_str()) {
+                                scores.insert(label.clone(), s);
+                            }
                         }
                     }
 
                     // Sort labels by score descending for consistent ordering
-                    let mut scored: Vec<(String, f64)> = scores_map.iter()
-                        .filter_map(|(label, score)| {
-                            let s = score.as_f64()?;
-                            if s >= self.label_min_score {
-                                Some((label.clone(), s))
+                    let mut scored: Vec<(String, f64)> = scores.iter()
+                        .filter_map(|(label, s)| {
+                            if *s >= self.label_min_score {
+                                Some((label.clone(), *s))
                             } else {
                                 None
                             }
@@ -499,18 +555,18 @@ impl Classifier {
             }
         }
 
-        bail!("Failed to parse classification from response (first 200 chars): {:.200}", content)
+        return Err(ClassifierError::Parse(format!("Failed to parse classification from response (first 200 chars): {:.200}", content)));
     }
 
     /// Returns (response_text, optional (kind, count) for profile event fetches)
-    async fn call_tool(&self, name: &str, arguments: &str, pubkey: &str) -> Result<(String, Option<(i64, usize)>)> {
+    async fn call_tool(&self, name: &str, arguments: &str, pubkey: &str) -> Result<(String, Option<(i64, usize)>), ClassifierError> {
         match name {
             "get_event" => {
                 let args: serde_json::Value = serde_json::from_str(arguments)
-                    .map_err(|e| anyhow::anyhow!("Invalid JSON arguments: {}", e))?;
+                    .map_err(|e| ClassifierError::InvalidToolArgs(format!("Invalid JSON arguments: {}", e)))?;
                 let event_id = args.get("event_id")
                     .and_then(|v| v.as_str())
-                    .ok_or_else(|| anyhow::anyhow!("Missing event_id"))?;
+                    .ok_or_else(|| ClassifierError::InvalidToolArgs("Missing event_id".to_string()))?;
 
                 // Check DB cache first
                 if let Some(cached) = self.db.get_event(event_id).await? {
@@ -532,10 +588,10 @@ impl Classifier {
             }
             "get_profile" => {
                 let args: serde_json::Value = serde_json::from_str(arguments)
-                    .map_err(|e| anyhow::anyhow!("Invalid JSON arguments: {}", e))?;
+                    .map_err(|e| ClassifierError::InvalidToolArgs(format!("Invalid JSON arguments: {}", e)))?;
                 let pubkey = args.get("pubkey")
                     .and_then(|v| v.as_str())
-                    .ok_or_else(|| anyhow::anyhow!("Missing pubkey"))?;
+                    .ok_or_else(|| ClassifierError::InvalidToolArgs("Missing pubkey".to_string()))?;
 
                 match self.profile_cache.get_profile(pubkey).await? {
                     Some(profile) => Ok((crate::format::describe_profile(&profile), None)),
@@ -544,10 +600,10 @@ impl Classifier {
             }
             "describe_image" => {
                 let args: serde_json::Value = serde_json::from_str(arguments)
-                    .map_err(|e| anyhow::anyhow!("Invalid JSON arguments: {}", e))?;
+                    .map_err(|e| ClassifierError::InvalidToolArgs(format!("Invalid JSON arguments: {}", e)))?;
                 let url = args.get("url")
                     .and_then(|v| v.as_str())
-                    .ok_or_else(|| anyhow::anyhow!("Missing url"))?;
+                    .ok_or_else(|| ClassifierError::InvalidToolArgs("Missing url".to_string()))?;
 
                 match self.image_cache.download(url).await? {
                     Some((path, hash)) => {
@@ -569,10 +625,10 @@ impl Classifier {
             }
             "resolve_nip21" => {
                 let args: serde_json::Value = serde_json::from_str(arguments)
-                    .map_err(|e| anyhow::anyhow!("Invalid JSON arguments: {}", e))?;
+                    .map_err(|e| ClassifierError::InvalidToolArgs(format!("Invalid JSON arguments: {}", e)))?;
                 let uri = args.get("uri")
                     .and_then(|v| v.as_str())
-                    .ok_or_else(|| anyhow::anyhow!("Missing uri"))?;
+                    .ok_or_else(|| ClassifierError::InvalidToolArgs("Missing uri".to_string()))?;
 
                 match nostr_sdk::nips::nip21::Nip21::parse(uri) {
                     Ok(nip21) => match nip21 {
@@ -661,10 +717,10 @@ impl Classifier {
             }
             "get_opengraph" => {
                 let args: serde_json::Value = serde_json::from_str(arguments)
-                    .map_err(|e| anyhow::anyhow!("Invalid JSON arguments: {}", e))?;
+                    .map_err(|e| ClassifierError::InvalidToolArgs(format!("Invalid JSON arguments: {}", e)))?;
                 let url = args.get("url")
                     .and_then(|v| v.as_str())
-                    .ok_or_else(|| anyhow::anyhow!("Missing url"))?;
+                    .ok_or_else(|| ClassifierError::InvalidToolArgs("Missing url".to_string()))?;
 
                 match self.og_cache.get_preview(url).await {
                     Some(data) => Ok((crate::format::describe_opengraph(&data), None)),
@@ -673,10 +729,10 @@ impl Classifier {
             }
             "get_profile_events" => {
                 let args: serde_json::Value = serde_json::from_str(arguments)
-                    .map_err(|e| anyhow::anyhow!("Invalid JSON arguments: {}", e))?;
+                    .map_err(|e| ClassifierError::InvalidToolArgs(format!("Invalid JSON arguments: {}", e)))?;
                 let kind = args.get("kind")
                     .and_then(|v| v.as_i64())
-                    .ok_or_else(|| anyhow::anyhow!("Missing kind"))?;
+                    .ok_or_else(|| ClassifierError::InvalidToolArgs("Missing kind".to_string()))?;
                 let since = args.get("since").and_then(|v| v.as_i64());
                 let until = args.get("until").and_then(|v| v.as_i64());
                 let limit = args.get("limit")
@@ -701,18 +757,18 @@ impl Classifier {
                 }
                 Ok((result, Some((kind, count))))
             }
-            _ => Err(anyhow::anyhow!("Unknown tool: {}", name)),
+            _ => Err(ClassifierError::UnknownTool(name.to_string())),
         }
     }
     
-    async fn encode_image(&self, path: &str) -> Result<String> {
-        let bytes = tokio::fs::read(path).await?;
+    async fn encode_image(&self, path: &str) -> Result<String, ClassifierError> {
+        let bytes = tokio::fs::read(path).await.map_err(|e| ClassifierError::Image(format!("Failed to read image: {}", e)))?;
         if bytes.is_empty() {
-            bail!("Failed to decode image");
+            return Err(ClassifierError::Image("Failed to decode image".to_string()));
         }
         
         // Load image
-        let img = image::load_from_memory(&bytes)?;
+        let img = image::load_from_memory(&bytes).map_err(|e| ClassifierError::Image(format!("Failed to load image: {}", e)))?;
         let (width, height) = img.dimensions();
         
         // Resize if either dimension exceeds 1024, preserving aspect ratio
@@ -728,12 +784,12 @@ impl Classifier {
         // Encode as JPEG with quality 85
         let mut jpeg_bytes = Vec::new();
         image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg_bytes, 85)
-            .encode(&img, img.width(), img.height(), image::ExtendedColorType::Rgb8)?;
+            .encode(&img, img.width(), img.height(), image::ExtendedColorType::Rgb8).map_err(|e| ClassifierError::Image(format!("Failed to encode JPEG: {}", e)))?;
         
         Ok(STANDARD.encode(&jpeg_bytes))
     }
 
-pub async fn describe_image(&self, path: &str) -> Result<String> {
+pub async fn describe_image(&self, path: &str) -> Result<String, ClassifierError> {
         let image_content = format!("data:image/jpeg;base64,{}", self.encode_image(&path).await?);
 
         // Detect if this is a video collage (files ending in .video.collage.jpg)
@@ -859,6 +915,7 @@ Scoring rules:
 - Multiple related labels can score high (e.g. both "bitcoin" and "lightning-network")
 - Use image descriptions to inform labels like "artist", "photographer", "nsfw", "bot" etc.
 - Reactions and reposts reveal interests just as much as original posts — someone who reacts to bitcoin content is interested in bitcoin
+- Language labels: Score the corresponding language label based on how frequently that language appears in the person's posts. A person who mostly posts in Japanese should score "japanese" high (0.8–1.0). Someone who occasionally posts in German alongside English should score "german" moderate (0.3–0.5). Score "english" the same way — if someone posts in English, score it accordingly.
 
 Generate:
 1. scores: An object mapping each label name to its score (0.0–1.0). Include ALL labels, even those scoring 0.0.

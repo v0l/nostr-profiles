@@ -1,11 +1,32 @@
 use crate::db::Database;
-use crate::classifier::Classifier;
+use crate::classifier::{Classifier, ClassifierError};
 use crate::image_cache::ImageCache;
-use anyhow::Result;
+use thiserror::Error;
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 use tokio::sync::{mpsc, Mutex};
+
+#[derive(Debug, Error)]
+pub enum JobError {
+    #[error("Job for profile {pubkey} timed out after {timeout}s")]
+    Timeout { pubkey: String, timeout: u64 },
+    #[error("Classification failed: {0}")]
+    Classifier(#[from] ClassifierError),
+    #[error("Database error: {0}")]
+    Database(String),
+}
+
+impl JobError {
+    pub fn is_server_error(&self) -> bool {
+        match self {
+            JobError::Classifier(e) => e.is_server_error(),
+            JobError::Timeout { .. } => true,
+            _ => false,
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct Job {
@@ -22,6 +43,9 @@ pub struct JobQueue {
     cache_days: u64,
     job_timeout: Duration,
     classification_event_limit: usize,
+    /// Shared consecutive server error count across all workers.
+    /// When > 0, workers sleep before picking up the next job.
+    consecutive_server_errors: Arc<AtomicU32>,
 }
 
 impl Clone for JobQueue {
@@ -35,6 +59,7 @@ impl Clone for JobQueue {
             cache_days: self.cache_days,
             job_timeout: self.job_timeout,
             classification_event_limit: self.classification_event_limit,
+            consecutive_server_errors: self.consecutive_server_errors.clone(),
         }
     }
 }
@@ -52,10 +77,11 @@ impl JobQueue {
             cache_days,
             job_timeout,
             classification_event_limit,
+            consecutive_server_errors: Arc::new(AtomicU32::new(0)),
         }
     }
 
-    pub async fn enqueue(&self, job: Job) -> Result<bool> {
+    pub async fn enqueue(&self, job: Job) -> Result<bool, mpsc::error::SendError<Job>> {
         // Check if this pubkey is already in the queue
         let mut queued = self.queued_pubkeys.lock().await;
         if queued.contains(&job.pubkey) {
@@ -95,6 +121,20 @@ impl JobQueue {
 
             let worker = tokio::spawn(async move {
                 loop {
+                    // Before picking up a job, check if we need to back off
+                    // due to server errors from any worker.
+                    let errs = queue.consecutive_server_errors.load(Ordering::Relaxed);
+                    if errs > 0 {
+                        // Exponential backoff: 2^errs seconds, capped at 5 min
+                        let delay = Duration::from_secs(1u64 << errs.min(8));
+                        let delay = delay.min(Duration::from_secs(300));
+                        tracing::info!(
+                            "Worker {} backing off {:?} after {} consecutive server errors",
+                            i, delay, errs
+                        );
+                        tokio::time::sleep(delay).await;
+                    }
+
                     // Acquire lock only to receive, then drop it immediately
                     // so other workers can receive while we process.
                     let job = {
@@ -106,12 +146,12 @@ impl JobQueue {
                     };
 
                     let pubkey = job.pubkey.clone();
-                    let result = tokio::time::timeout(
+                    let result: Result<(), JobError> = tokio::time::timeout(
                         job_timeout,
                         process_job(&job, &db, &classifier, &image_cache, cache_days, queue.classification_event_limit),
                     )
                     .await
-                    .map_err(|_| anyhow::anyhow!("Job for profile {} timed out after {}s", pubkey, job_timeout.as_secs()))
+                    .map_err(|_| JobError::Timeout { pubkey: pubkey.clone(), timeout: job_timeout.as_secs() })
                     .and_then(|r| r);
                     match result {
                         Ok(_) => {
@@ -120,14 +160,25 @@ impl JobQueue {
                                 i,
                                 pubkey
                             );
+                            // Reset backoff on success
+                            queue.consecutive_server_errors.store(0, Ordering::Relaxed);
                         }
                         Err(e) => {
-                            tracing::error!(
-                                "Worker {} failed to process profile {}: {}",
-                                i,
-                                pubkey,
-                                e
-                            );
+                            let is_server_error = e.is_server_error();
+                            if is_server_error {
+                                let prev = queue.consecutive_server_errors.fetch_add(1, Ordering::Relaxed);
+                                tracing::warn!(
+                                    "Worker {} LLM server error for {} (consecutive: {}): {}",
+                                    i, pubkey, prev + 1, e
+                                );
+                            } else {
+                                tracing::error!(
+                                    "Worker {} failed to process profile {}: {}",
+                                    i,
+                                    pubkey,
+                                    e
+                                );
+                            }
                             // Retry if under the limit
                             if job.retry_count < max_retries {
                                 let retry_job = Job {
@@ -180,6 +231,7 @@ impl JobQueue {
             cache_days: self.cache_days,
             job_timeout: self.job_timeout,
             classification_event_limit: self.classification_event_limit,
+            consecutive_server_errors: self.consecutive_server_errors.clone(),
         }
     }
 }
@@ -191,11 +243,12 @@ async fn process_job(
     _image_cache: &ImageCache,
     cache_days: u64,
     classification_event_limit: usize,
-) -> Result<()> {
+) -> Result<(), JobError> {
     let start = std::time::Instant::now();
     let pubkey = &job.pubkey;
 
-    let events = db.get_profile_events(pubkey, classification_event_limit).await?;
+    let events = db.get_profile_events(pubkey, classification_event_limit).await
+        .map_err(|e| JobError::Database(e.to_string()))?;
 
     // Ensure we have profile metadata — fetch from relays if missing
     if let Err(e) = classifier.profile_cache().ensure_metadata(pubkey).await {
@@ -252,10 +305,12 @@ async fn process_job(
         analyzed_event_count: total_analyzed,
     };
     db.save_classification(pubkey, &classification_db, total_analyzed as usize, crate::CLASSIFICATION_EPOCH)
-        .await?;
+        .await
+        .map_err(|e| JobError::Database(e.to_string()))?;
 
     // Clean up old events now that classification is done
-    let deleted = db.delete_old_events_for_pubkey(pubkey, cache_days).await?;
+    let deleted = db.delete_old_events_for_pubkey(pubkey, cache_days).await
+        .map_err(|e| JobError::Database(e.to_string()))?;
     if deleted > 0 {
         tracing::info!(
             "Cleaned up {} events older than {} days for profile {}",
