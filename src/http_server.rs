@@ -13,6 +13,7 @@ use nostr_relay_builder::LocalRelay;
 use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
 use std::sync::Arc;
+use tower_http::services::ServeDir;
 
 /// Shared application state: the database, the search relay, and the job queue.
 #[derive(Clone)]
@@ -114,6 +115,7 @@ pub async fn serve(db: Arc<Database>, relay: LocalRelay, job_queue: Arc<JobQueue
         .route("/api/recent", get(get_recent))
         .route("/api/search", get(search))
         .route("/api/stats", get(get_stats))
+        .fallback_service(ServeDir::new("dashboard/dist"))
         .with_state(state);
 
     let addr = format!("0.0.0.0:{}", port);
@@ -138,12 +140,12 @@ async fn root_handler(State(state): State<AppState>, req: Request) -> Response {
     if is_ws_upgrade {
         ws_upgrade(state, req).await
     } else {
-        serve_dashboard().await.into_response()
+        // Serve dashboard SPA index
+        match tokio::fs::read_to_string("dashboard/dist/index.html").await {
+            Ok(html) => Html(html).into_response(),
+            Err(_) => (StatusCode::NOT_FOUND, "Dashboard not found").into_response(),
+        }
     }
-}
-
-async fn serve_dashboard() -> Html<&'static str> {
-    Html(include_str!("../dashboard.html"))
 }
 
 async fn get_profile(

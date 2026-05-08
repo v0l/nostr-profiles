@@ -3,3 +3,5 @@
 /nostr_classify.db-journal
 .idea/
 collage.jpg
+dashboard/node_modules/
+dashboard/dist/

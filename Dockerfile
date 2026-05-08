@@ -1,3 +1,11 @@
+# ── Dashboard build ────────────────────────────────────────────────────────────
+FROM oven/bun:1 AS dashboard-build
+WORKDIR /dashboard
+COPY dashboard/package.json dashboard/bun.lockb ./
+RUN bun install --frozen-lockfile
+COPY dashboard/ ./
+RUN bun run build
+
 # ── Rust dependency cache ─────────────────────────────────────────────────────
 FROM voidic/rust-ffmpeg AS rust-deps
 WORKDIR /src
@@ -12,7 +20,6 @@ RUN cargo build --release && \
 FROM rust-deps AS rust-build
 COPY src ./src
 COPY migrations ./migrations
-COPY dashboard.html ./
 RUN touch src/main.rs
 RUN cargo build --release && \
     mkdir -p /app/bin && \
@@ -45,6 +52,7 @@ RUN apt-get update && \
 
 COPY --from=rust-build /app/bin       ./bin
 COPY --from=rust-build /app/src/ffmpeg/lib/ /lib
+COPY --from=dashboard-build /dashboard/dist ./dashboard/dist
 
 ENV RUST_BACKTRACE=1
 

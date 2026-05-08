@@ -1,0 +1,429 @@
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  font-family: system-ui, sans-serif;
+  background: #1a1a1a;
+  color: #e0e0e0;
+  min-height: 100vh;
+}
+
+.app {
+  max-width: 960px;
+  margin: 0 auto;
+  padding: 20px;
+}
+
+h1 {
+  margin-bottom: 20px;
+  color: #fff;
+}
+
+h2 {
+  color: #fff;
+  font-size: 18px;
+  margin-bottom: 16px;
+  margin-top: 32px;
+}
+
+.search-box {
+  display: flex;
+  gap: 10px;
+  margin-bottom: 24px;
+}
+
+.search-box input {
+  flex: 1;
+  padding: 12px 16px;
+  background: #2a2a2a;
+  border: 1px solid #3a3a3a;
+  border-radius: 8px;
+  color: #e0e0e0;
+  font-size: 14px;
+  outline: none;
+}
+
+.search-box input:focus {
+  border-color: #64b5f6;
+}
+
+.search-box button {
+  padding: 12px 24px;
+  background: #64b5f6;
+  color: #1a1a1a;
+  border: none;
+  border-radius: 8px;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.search-box button:hover {
+  background: #42a5f5;
+}
+
+.search-box button:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.error {
+  color: #ef5350;
+  padding: 10px;
+  background: #2a1a1a;
+  border-radius: 6px;
+  margin-bottom: 16px;
+}
+
+.card {
+  background: #2a2a2a;
+  border-radius: 12px;
+  border: 1px solid #3a3a3a;
+  padding: 20px;
+  margin-bottom: 12px;
+}
+
+.card-header {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin-bottom: 14px;
+}
+
+.avatar {
+  width: 48px;
+  height: 48px;
+  border-radius: 50%;
+  background: #444;
+  object-fit: cover;
+  flex-shrink: 0;
+}
+
+.avatar-small {
+  width: 32px;
+  height: 32px;
+}
+
+.author-info {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  overflow: hidden;
+}
+
+.author-name {
+  font-weight: 600;
+  color: #fff;
+  font-size: 16px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.nip05 {
+  font-size: 12px;
+  color: #64b5f6;
+}
+
+.pubkey {
+  font-family: monospace;
+  font-size: 11px;
+  color: #888;
+  word-break: break-all;
+}
+
+.about {
+  color: #bbb;
+  line-height: 1.5;
+  margin-bottom: 14px;
+  font-size: 14px;
+}
+
+.meta {
+  display: flex;
+  gap: 16px;
+  font-size: 12px;
+  color: #888;
+  margin-bottom: 16px;
+  padding-bottom: 16px;
+  border-bottom: 1px solid #3a3a3a;
+}
+
+.meta span {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.labels {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 12px;
+}
+
+.label {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 10px;
+  border-radius: 12px;
+  font-size: 12px;
+  color: #e0e0e0;
+  overflow: hidden;
+}
+
+.label-bg {
+  position: absolute;
+  inset: 0;
+  border-radius: 12px;
+  opacity: 0.35;
+}
+
+.label-text {
+  position: relative;
+  z-index: 1;
+}
+
+.label-score {
+  position: relative;
+  z-index: 1;
+  font-size: 10px;
+  opacity: 0.6;
+}
+
+.bio {
+  color: #bbb;
+  line-height: 1.5;
+  font-size: 14px;
+  margin-bottom: 10px;
+}
+
+.confidence {
+  font-size: 12px;
+  color: #888;
+}
+
+.confidence-bar {
+  height: 4px;
+  background: #3a3a3a;
+  border-radius: 2px;
+  margin-top: 6px;
+  overflow: hidden;
+}
+
+.confidence-fill {
+  height: 100%;
+  border-radius: 2px;
+  transition: width 0.3s;
+}
+
+.no-classification {
+  color: #666;
+  font-style: italic;
+  font-size: 14px;
+}
+
+.recent-item {
+  cursor: pointer;
+  transition: border-color 0.2s;
+}
+
+.recent-item:hover {
+  border-color: #64b5f6;
+}
+
+.recent-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+
+.recent-name {
+  font-weight: 600;
+  color: #fff;
+  font-size: 14px;
+  flex: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.recent-time {
+  font-size: 11px;
+  color: #666;
+  flex-shrink: 0;
+}
+
+.loading {
+  text-align: center;
+  padding: 40px;
+  color: #666;
+}
+
+.stats-row {
+  display: flex;
+  gap: 10px;
+  margin-bottom: 24px;
+}
+
+.stat-card {
+  flex: 1;
+  background: #2a2a2a;
+  border: 1px solid #3a3a3a;
+  border-radius: 10px;
+  padding: 14px 16px;
+  text-align: center;
+}
+
+.stat-value {
+  font-size: 28px;
+  font-weight: 700;
+  color: #fff;
+  line-height: 1.2;
+}
+
+.stat-label {
+  font-size: 11px;
+  color: #888;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin-top: 4px;
+}
+
+.stat-value.green {
+  color: #66bb6a;
+}
+.stat-value.blue {
+  color: #64b5f6;
+}
+.stat-value.orange {
+  color: #ffa726;
+}
+
+.label-stats {
+  background: #2a2a2a;
+  border: 1px solid #3a3a3a;
+  border-radius: 10px;
+  padding: 16px 20px;
+  margin-bottom: 24px;
+}
+
+.label-stats h3 {
+  color: #fff;
+  font-size: 14px;
+  margin-bottom: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.label-bar-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 6px;
+}
+
+.label-bar-name {
+  width: 120px;
+  font-size: 12px;
+  color: #ccc;
+  text-align: right;
+  flex-shrink: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.label-bar-track {
+  flex: 1;
+  height: 18px;
+  background: #3a3a3a;
+  border-radius: 4px;
+  overflow: hidden;
+  position: relative;
+}
+
+.label-bar-fill {
+  height: 100%;
+  border-radius: 4px;
+  transition: width 0.4s;
+}
+
+.label-bar-count {
+  width: 50px;
+  font-size: 11px;
+  color: #888;
+  flex-shrink: 0;
+}
+
+.labels-toggle {
+  font-size: 12px;
+  color: #64b5f6;
+  cursor: pointer;
+  background: none;
+  border: none;
+  padding: 6px 0;
+  text-align: left;
+}
+
+.labels-toggle:hover {
+  color: #42a5f5;
+}
+
+.kind-breakdown {
+  margin-bottom: 16px;
+}
+
+.kind-bar-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 4px;
+}
+
+.kind-bar-name {
+  width: 160px;
+  font-size: 12px;
+  color: #ccc;
+  text-align: right;
+  flex-shrink: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.kind-bar-track {
+  flex: 1;
+  height: 16px;
+  background: #3a3a3a;
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.kind-bar-fill {
+  height: 100%;
+  border-radius: 4px;
+  background: #81c784;
+  transition: width 0.4s;
+}
+
+.kind-bar-count {
+  width: 40px;
+  font-size: 11px;
+  color: #888;
+  flex-shrink: 0;
+}
+
+.kind-bar-pct {
+  width: 40px;
+  font-size: 11px;
+  color: #666;
+  flex-shrink: 0;
+  text-align: right;
+}
