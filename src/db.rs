@@ -153,18 +153,26 @@ impl Database {
                 // Record the init migration as applied so sqlx::migrate skips it.
                 let migrator = sqlx::migrate!();
                 if let Some(init) = migrator.iter().find(|m| m.version == 20250101000000) {
+                    // Match the exact schema sqlx-sqlite uses (no `type` column)
                     sqlx::query(
-                        "CREATE TABLE IF NOT EXISTS _sqlx_migrations (version BIGINT PRIMARY KEY, description TEXT NOT NULL, type INTEGER NOT NULL, checksum BLOB NOT NULL, installed_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, execution_time BIGINT NOT NULL, success BOOLEAN NOT NULL)"
+                        r#"CREATE TABLE IF NOT EXISTS _sqlx_migrations (
+                            version BIGINT PRIMARY KEY,
+                            description TEXT NOT NULL,
+                            installed_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                            success BOOLEAN NOT NULL,
+                            checksum BLOB NOT NULL,
+                            execution_time BIGINT NOT NULL
+                        )"#
                     )
                     .execute(pool)
                     .await?;
 
                     sqlx::query(
-                        "INSERT INTO _sqlx_migrations (version, description, type, checksum, execution_time, success) VALUES (?, ?, ?, ?, 0, 1)"
+                        r#"INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time)
+                           VALUES (?, ?, TRUE, ?, -1)"#
                     )
                     .bind(init.version as i64)
                     .bind(&init.description)
-                    .bind(init.migration_type as i64)
                     .bind(init.checksum.as_ref() as &[u8])
                     .execute(pool)
                     .await?;
