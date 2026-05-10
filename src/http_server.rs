@@ -35,6 +35,7 @@ enum ClassificationStatusResponse {
 struct ProfileResponse {
     pubkey: String,
     name: Option<String>,
+    display_name: Option<String>,
     about: Option<String>,
     picture: Option<String>,
     nip05: Option<String>,
@@ -87,6 +88,7 @@ struct LabelCount {
 pub struct RecentClassification {
     pub pubkey: String,
     pub name: Option<String>,
+    pub display_name: Option<String>,
     pub picture: Option<String>,
     pub scores: std::collections::HashMap<String, f64>,
     pub bio: String,
@@ -181,6 +183,7 @@ async fn get_profile(
     let mut response = ProfileResponse {
         pubkey: profile.pubkey,
         name: profile.name,
+        display_name: profile.display_name,
         about: profile.about,
         picture: profile.picture,
         nip05: profile.nip05,

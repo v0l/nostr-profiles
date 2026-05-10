@@ -56,6 +56,7 @@ pub struct Profile {
     pub pubkey: String,
     pub nip05: Option<String>,
     pub name: Option<String>,
+    pub display_name: Option<String>,
     pub about: Option<String>,
     pub picture: Option<String>,
     pub is_classified: bool,
@@ -321,6 +322,7 @@ impl Database {
                 sqlx::query(
                     r#"UPDATE profiles SET
                         name = COALESCE(?, name),
+                        display_name = COALESCE(?, display_name),
                         about = COALESCE(?, about),
                         picture = COALESCE(?, picture),
                         nip05 = COALESCE(?, nip05),
@@ -330,6 +332,7 @@ impl Database {
                     WHERE pubkey = ? AND (metadata_created_at IS NULL OR metadata_created_at < ?)"#,
                 )
                 .bind(meta.name.as_deref())
+                .bind(meta.display_name.as_deref())
                 .bind(meta.about.as_deref())
                 .bind(meta.picture.as_deref())
                 .bind(meta.nip05.as_deref())
@@ -528,6 +531,7 @@ impl Database {
         };
 
         let name = meta.name.as_deref();
+        let display_name = meta.display_name.as_deref();
         let about = meta.about.as_deref();
         let picture = meta.picture.as_deref();
         let nip05 = meta.nip05.as_deref();
@@ -537,6 +541,7 @@ impl Database {
             r#"
             UPDATE profiles SET
                 name = COALESCE(?, name),
+                display_name = COALESCE(?, display_name),
                 about = COALESCE(?, about),
                 picture = COALESCE(?, picture),
                 nip05 = COALESCE(?, nip05),
@@ -547,6 +552,7 @@ impl Database {
             "#,
         )
         .bind(name)
+        .bind(display_name)
         .bind(about)
         .bind(picture)
         .bind(nip05)
@@ -582,7 +588,7 @@ impl Database {
 
     pub async fn get_profile_details(&self, pubkey: &str) -> Result<Profile> {
         let profile = sqlx::query_as::<_, Profile>(
-            r#"SELECT pubkey, nip05, name, about, picture, is_classified, follower_count, metadata_json, created_at, updated_at FROM profiles WHERE pubkey = ?"#,
+            r#"SELECT pubkey, nip05, name, display_name, about, picture, is_classified, follower_count, metadata_json, created_at, updated_at FROM profiles WHERE pubkey = ?"#,
         )
         .bind(pubkey)
         .fetch_one(&self.pool)
@@ -651,7 +657,7 @@ impl Database {
 
     pub async fn get_profile_by_pubkey(&self, pubkey: &str) -> Result<Option<Profile>> {
         let profile = sqlx::query_as::<_, Profile>(
-            r#"SELECT pubkey, nip05, name, about, picture, is_classified, follower_count, metadata_json, metadata_created_at, created_at, updated_at FROM profiles WHERE pubkey = ?"#,
+            r#"SELECT pubkey, nip05, name, display_name, about, picture, is_classified, follower_count, metadata_json, metadata_created_at, created_at, updated_at FROM profiles WHERE pubkey = ?"#,
         )
         .bind(pubkey)
         .fetch_optional(&self.pool)
@@ -815,9 +821,9 @@ impl Database {
     }
 
     pub async fn get_recent_classifications(&self, limit: i64) -> Result<Vec<crate::http_server::RecentClassification>> {
-        let rows = sqlx::query_as::<_, (String, Option<String>, Option<String>, String, String, f64, Option<chrono::DateTime<chrono::Utc>>, Option<String>)>(
+        let rows = sqlx::query_as::<_, (String, Option<String>, Option<String>, Option<String>, String, String, f64, Option<chrono::DateTime<chrono::Utc>>, Option<String>)>(
             r#"
-            SELECT p.pubkey, p.name, p.picture, c.scores, c.bio, c.confidence, c.analyzed_at, p.metadata_json
+            SELECT p.pubkey, p.name, p.display_name, p.picture, c.scores, c.bio, c.confidence, c.analyzed_at, p.metadata_json
             FROM classifications c
             JOIN profiles p ON c.pubkey = p.pubkey
             ORDER BY c.analyzed_at DESC
@@ -828,11 +834,12 @@ impl Database {
         .fetch_all(&self.pool)
         .await?;
 
-        let results = rows.into_iter().map(|(pubkey, name, picture, scores, bio, confidence, analyzed_at, metadata_json)| {
+        let results = rows.into_iter().map(|(pubkey, name, display_name, picture, scores, bio, confidence, analyzed_at, metadata_json)| {
             let parsed_scores: std::collections::HashMap<String, f64> = serde_json::from_str(&scores).unwrap_or_default();
             crate::http_server::RecentClassification {
                 pubkey,
                 name,
+                display_name,
                 picture,
                 scores: parsed_scores,
                 bio,
@@ -918,9 +925,9 @@ impl Database {
         // Add prefix matching to each term so "bitc" matches "bitcoin"
         let fts_query = Self::prepare_fts_query(query);
 
-        let rows = sqlx::query_as::<_, (String, Option<String>, Option<String>, String, String, f64, Option<chrono::DateTime<chrono::Utc>>, Option<String>)>(
+        let rows = sqlx::query_as::<_, (String, Option<String>, Option<String>, Option<String>, String, String, f64, Option<chrono::DateTime<chrono::Utc>>, Option<String>)>(
             r#"
-            SELECT p.pubkey, p.name, p.picture, c.scores, c.bio, c.confidence, c.analyzed_at, p.metadata_json
+            SELECT p.pubkey, p.name, p.display_name, p.picture, c.scores, c.bio, c.confidence, c.analyzed_at, p.metadata_json
             FROM classifications c
             JOIN profiles p ON c.pubkey = p.pubkey
             JOIN classifications_fts fts ON fts.rowid = c.id
@@ -934,11 +941,12 @@ impl Database {
         .fetch_all(&self.pool)
         .await?;
 
-        let results = rows.into_iter().map(|(pubkey, name, picture, scores, bio, confidence, analyzed_at, metadata_json)| {
+        let results = rows.into_iter().map(|(pubkey, name, display_name, picture, scores, bio, confidence, analyzed_at, metadata_json)| {
             let parsed_scores: std::collections::HashMap<String, f64> = serde_json::from_str(&scores).unwrap_or_default();
             crate::http_server::RecentClassification {
                 pubkey,
                 name,
+                display_name,
                 picture,
                 scores: parsed_scores,
                 bio,

@@ -79,6 +79,7 @@ interface RecentItemProps {
   item: {
     pubkey: string;
     name?: string | null;
+    display_name?: string | null;
     picture?: string | null;
     scores: Record<string, number>;
     analyzed_at?: string | null;
@@ -87,7 +88,8 @@ interface RecentItemProps {
 }
 
 export function RecentItemCard({ item, onSearch }: RecentItemProps) {
-  const name = item.name || item.pubkey.slice(0, 12) + "...";
+  const displayName = item.display_name || item.name;
+  const name = displayName || item.pubkey.slice(0, 12) + "...";
   return (
     <div class="card recent-item" onClick={() => onSearch(item.pubkey)}>
       <div class="recent-header">

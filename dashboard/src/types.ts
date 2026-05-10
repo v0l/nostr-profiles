@@ -34,6 +34,7 @@ export interface KindBreakdown {
 export interface Profile {
   pubkey: string;
   name?: string | null;
+  display_name?: string | null;
   about?: string | null;
   picture?: string | null;
   nip05?: string | null;
@@ -48,6 +49,7 @@ export interface Profile {
 export interface RecentItem {
   pubkey: string;
   name?: string | null;
+  display_name?: string | null;
   picture?: string | null;
   scores: Record<string, number>;
   bio: string;

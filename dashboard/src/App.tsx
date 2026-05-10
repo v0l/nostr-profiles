@@ -92,7 +92,7 @@ export function App() {
         const idx = prev.findIndex((r) => r.pubkey === profile.pubkey);
         if (idx === -1) return prev;
         const updated = [...prev];
-        updated[idx] = { ...updated[idx], name: profile.name, picture: profile.picture };
+        updated[idx] = { ...updated[idx], name: profile.name, display_name: profile.display_name, picture: profile.picture };
         return updated;
       });
     }

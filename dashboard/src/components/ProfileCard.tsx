@@ -72,7 +72,7 @@ interface ProfileCardProps {
 }
 
 export function ProfileCard({ profile }: ProfileCardProps) {
-  const { name, picture, nip05, pubkey, about, event_count, classification_status, classification } =
+  const { name, display_name, picture, nip05, pubkey, about, event_count, classification_status, classification } =
     profile;
 
   const isStale =
@@ -86,6 +86,7 @@ export function ProfileCard({ profile }: ProfileCardProps) {
   const statusColor =
     classification_status === "current" ? "#66bb6a" : isStale ? "#ffa726" : "#ef5350";
   const hasClassification = classification_status !== "none";
+  const displayName = display_name || name;
 
   return (
     <div class="card">
@@ -99,7 +100,7 @@ export function ProfileCard({ profile }: ProfileCardProps) {
           />
         )}
         <div class="author-info">
-          <span class="author-name">{name || "Unknown"}</span>
+          <span class="author-name">{displayName || "Unknown"}</span>
           {nip05 && <span class="nip05">{nip05}</span>}
           <span class="pubkey">{pubkey}</span>
         </div>
