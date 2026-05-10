@@ -1,7 +1,7 @@
 # ── Dashboard build ────────────────────────────────────────────────────────────
 FROM oven/bun:1 AS dashboard-build
 WORKDIR /dashboard
-COPY dashboard/package.json dashboard/bun.lockb ./
+COPY dashboard/package.json dashboard/bun.lock ./
 RUN bun install --frozen-lockfile
 COPY dashboard/ ./
 RUN bun run build
