@@ -108,6 +108,12 @@ struct SearchQuery {
     limit: Option<i64>,
 }
 
+#[derive(Deserialize)]
+struct LabelSearchQuery {
+    label: String,
+    limit: Option<i64>,
+}
+
 pub async fn serve(db: Arc<Database>, relay: LocalRelay, job_queue: Arc<JobQueue>, port: u16) {
     let state = AppState { db, relay, job_queue };
 
@@ -116,6 +122,7 @@ pub async fn serve(db: Arc<Database>, relay: LocalRelay, job_queue: Arc<JobQueue
         .route("/api/profile/{pubkey}", get(get_profile))
         .route("/api/recent", get(get_recent))
         .route("/api/search", get(search))
+        .route("/api/search/label", get(search_by_label))
         .route("/api/stats", get(get_stats))
         .fallback_service(ServeDir::new("dashboard/dist"))
         .with_state(state);
@@ -245,6 +252,21 @@ async fn search(
     }
     let limit = query.limit.unwrap_or(20).min(100);
     match state.db.search_classifications(q, limit).await {
+        Ok(results) => Json(results).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("Error: {}", e)).into_response(),
+    }
+}
+
+async fn search_by_label(
+    State(state): State<AppState>,
+    axum::extract::Query(query): axum::extract::Query<LabelSearchQuery>,
+) -> impl IntoResponse {
+    let label = query.label.trim();
+    if label.is_empty() {
+        return (StatusCode::BAD_REQUEST, "label is required").into_response();
+    }
+    let limit = query.limit.unwrap_or(20).min(100);
+    match state.db.search_by_label(label, limit).await {
         Ok(results) => Json(results).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("Error: {}", e)).into_response(),
     }

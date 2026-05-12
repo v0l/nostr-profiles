@@ -173,6 +173,7 @@ h2 {
   padding: 4px 10px;
   border-radius: 12px;
   font-size: 12px;
+  cursor: pointer;
   color: #e0e0e0;
   overflow: hidden;
 }
@@ -182,6 +183,7 @@ h2 {
   inset: 0;
   border-radius: 12px;
   opacity: 0.35;
+  pointer-events: none;
 }
 
 .label-text {
@@ -327,6 +329,21 @@ h2 {
   align-items: center;
   gap: 10px;
   margin-bottom: 6px;
+}
+
+.label-bar-row-clickable {
+  cursor: pointer;
+  border-radius: 4px;
+  padding: 2px 4px;
+  margin: -2px -4px;
+}
+
+.label-bar-row-clickable:hover {
+  background: #3a3a3a;
+}
+
+.label-bar-row-clickable:hover .label-bar-name {
+  color: #64b5f6;
 }
 
 .label-bar-name {

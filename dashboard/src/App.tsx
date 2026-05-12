@@ -42,6 +42,25 @@ export function App() {
             return;
           }
           setProfile(await res.json());
+        } else if (pk) {
+          // pk is a label name passed from LabelStatsPanel
+          const res = await fetch("/api/search/label?label=" + encodeURIComponent(key));
+          if (!res.ok) {
+            setError((await res.text()) || "Label search failed");
+            return;
+          }
+          const results = await res.json();
+          setRecent(results);
+          if (results.length === 0) {
+            setError("No profiles found with label: " + key);
+            return;
+          }
+          const first = results[0];
+          const profileRes = await fetch("/api/profile/" + encodeURIComponent(first.pubkey));
+          if (profileRes.ok) {
+            setProfile(await profileRes.json());
+          }
+          setRecent(results);
         } else {
           const res = await fetch("/api/search?q=" + encodeURIComponent(key));
           if (!res.ok) {
@@ -103,7 +122,7 @@ export function App() {
       <h1>Nostr Profile Classifier</h1>
 
       <StatsBar stats={stats} />
-      <LabelStatsPanel stats={stats} />
+      <LabelStatsPanel stats={stats} onSearch={searchProfile} />
 
       <div class="search-box">
         <input

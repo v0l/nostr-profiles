@@ -1,11 +1,33 @@
 import type { Classification, KindBreakdown } from "../types";
 
-export function LabelPill({ label, score }: { label: string; score: number }) {
+export function LabelPill({
+  label,
+  score,
+  onClick,
+}: {
+  label: string;
+  score: number;
+  onClick?: () => void;
+}) {
   const color =
     score >= 0.8 ? "#66bb6a" : score >= 0.6 ? "#64b5f6" : score >= 0.4 ? "#ffa726" : "#ef5350";
 
   return (
-    <span class="label">
+    <span
+      class="label"
+      role="button"
+      tabIndex={0}
+      onClick={(e) => {
+        e.stopPropagation();
+        onClick?.();
+      }}
+      onKeyDown={(e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.stopPropagation();
+          onClick?.();
+        }
+      }}
+      title={`Search for ${label}`}>
       <span class="label-bg" style={{ background: color }} />
       <span class="label-text">{label}</span>
       <span class="label-score">{(score * 100).toFixed(0)}%</span>
@@ -57,6 +79,7 @@ export function KindBreakdownView({
 interface ProfileCardProps {
   profile: {
     name?: string | null;
+    display_name?: string | null;
     picture?: string | null;
     nip05?: string | null;
     pubkey: string;
@@ -71,7 +94,7 @@ interface ProfileCardProps {
   onSearch: (pubkey: string) => void;
 }
 
-export function ProfileCard({ profile }: ProfileCardProps) {
+export function ProfileCard({ profile, onSearch }: ProfileCardProps) {
   const { name, display_name, picture, nip05, pubkey, about, event_count, classification_status, classification } =
     profile;
 
@@ -138,7 +161,7 @@ export function ProfileCard({ profile }: ProfileCardProps) {
                 .sort((a, b) => b[1] - a[1])
                 .filter(([_, s]) => s >= 0.3)
                 .map(([l, score]) => (
-                  <LabelPill key={l} label={l} score={score} />
+                  <LabelPill key={l} label={l} score={score} onClick={() => onSearch(l)} />
                 ))}
             </div>
             <p class="bio">{classification.bio}</p>

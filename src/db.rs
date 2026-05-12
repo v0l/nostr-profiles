@@ -687,6 +687,12 @@ impl Database {
         let scores = serde_json::to_string(&classification.scores)?;
         let kind_breakdown = serde_json::to_string(&classification.kind_breakdown)?;
 
+        // Delete old label rows for this pubkey
+        sqlx::query("DELETE FROM classification_labels WHERE pubkey = ?")
+            .bind(pubkey)
+            .execute(&self.pool)
+            .await?;
+
         sqlx::query(
             r#"
             INSERT INTO classifications (pubkey, scores, bio, confidence, analyzed_event_count, kind_breakdown, classification_epoch)
@@ -710,6 +716,18 @@ impl Database {
         .bind(epoch as i64)
         .execute(&self.pool)
         .await?;
+
+        // Populate indexed label rows
+        for (label, score) in &classification.scores {
+            sqlx::query(
+                "INSERT INTO classification_labels (pubkey, label, score) VALUES (?, ?, ?)",
+            )
+            .bind(pubkey)
+            .bind(label)
+            .bind(score)
+            .execute(&self.pool)
+            .await?;
+        }
 
         // Rebuild FTS entry for this profile
         self.rebuild_fts_for_pubkey(pubkey).await?;
@@ -874,16 +892,16 @@ impl Database {
             .execute(&self.pool)
             .await?;
 
-        // Derive labels from scores JSON keys, joined as space-separated text for FTS
+        // Derive labels from the indexed classification_labels table, joined as space-separated text for FTS
         sqlx::query(
             r#"
             INSERT INTO classifications_fts (rowid, name, about, nip05, labels, scores, bio, pubkey)
             SELECT c.id, p.name, p.about, p.nip05,
-                   (SELECT group_concat(key, ' ') FROM json_each(c.scores)),
+                   (SELECT group_concat(cl.label, ' ') FROM classification_labels cl WHERE cl.pubkey = c.pubkey),
                    c.scores,
                    c.bio, c.pubkey
             FROM classifications c
-            JOIN profiles p ON c.pubkey = p.pubkey
+            JOIN profiles p ON p.pubkey = c.pubkey
             WHERE c.pubkey = ?
             "#,
         )
@@ -908,11 +926,11 @@ impl Database {
             r#"
             INSERT INTO classifications_fts (rowid, name, about, nip05, labels, scores, bio, pubkey)
             SELECT c.id, p.name, p.about, p.nip05,
-                   (SELECT group_concat(key, ' ') FROM json_each(c.scores)),
+                   (SELECT group_concat(cl.label, ' ') FROM classification_labels cl WHERE cl.pubkey = c.pubkey),
                    c.scores,
                    c.bio, c.pubkey
             FROM classifications c
-            JOIN profiles p ON c.pubkey = p.pubkey
+            JOIN profiles p ON p.pubkey = c.pubkey
             "#,
         )
         .execute(&self.pool)
@@ -959,6 +977,42 @@ impl Database {
         Ok(results)
     }
 
+    /// Search profiles by exact label match using the indexed classification_labels table.
+    pub async fn search_by_label(&self, label: &str, limit: i64) -> Result<Vec<crate::http_server::RecentClassification>> {
+        let rows = sqlx::query_as::<_, (String, Option<String>, Option<String>, Option<String>, String, String, f64, Option<chrono::DateTime<chrono::Utc>>, Option<String>)>(
+            r#"
+            SELECT p.pubkey, p.name, p.display_name, p.picture, c.scores, c.bio, c.confidence, c.analyzed_at, p.metadata_json
+            FROM classification_labels l
+            JOIN classifications c ON c.pubkey = l.pubkey
+            JOIN profiles p ON p.pubkey = c.pubkey
+            WHERE l.label = ?
+            ORDER BY c.analyzed_at DESC
+            LIMIT ?
+            "#,
+        )
+        .bind(label)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let results = rows.into_iter().map(|(pubkey, name, display_name, picture, scores, bio, confidence, analyzed_at, metadata_json)| {
+            let parsed_scores: std::collections::HashMap<String, f64> = serde_json::from_str(&scores).unwrap_or_default();
+            crate::http_server::RecentClassification {
+                pubkey,
+                name,
+                display_name,
+                picture,
+                scores: parsed_scores,
+                bio,
+                confidence,
+                analyzed_at: analyzed_at.map(|t| t.to_rfc3339()),
+                metadata_json,
+            }
+        }).collect();
+
+        Ok(results)
+    }
+
     /// Get all stats in a single query.
     /// Returns (total_profiles, classified_profiles, total_unique_labels, label_counts, images_classified, total_events).
     /// Labels are derived from scores keys where score >= label_min_score.
@@ -977,13 +1031,13 @@ impl Database {
             .fetch_one(&self.pool)
             .await?;
 
-        // Derive label counts from scores — each key in json_each(scores) is a label,
-        // filtered by score >= label_min_score
+        // Derive label counts from the indexed classification_labels table
         let label_counts = sqlx::query_as::<_, (String, i64)>(
-            r#"SELECT je.key AS label, COUNT(*) AS count
-               FROM classifications, json_each(scores) AS je
-               WHERE je.value >= ? AND classifications.classification_epoch >= ?
-               GROUP BY je.key
+            r#"SELECT label, COUNT(*) AS count
+               FROM classification_labels
+               JOIN classifications ON classifications.pubkey = classification_labels.pubkey
+               WHERE classification_labels.score >= ? AND classifications.classification_epoch >= ?
+               GROUP BY label
                ORDER BY count DESC"#,
         )
         .bind(min_score)

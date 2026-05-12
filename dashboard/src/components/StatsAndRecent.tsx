@@ -5,6 +5,7 @@ import { timeAgo } from "../types";
 
 interface StatsBarProps {
   stats: Stats | null;
+  onSearch?: (query: string) => void;
 }
 
 export function StatsBar({ stats }: StatsBarProps) {
@@ -39,7 +40,7 @@ export function StatsBar({ stats }: StatsBarProps) {
   );
 }
 
-export function LabelStatsPanel({ stats }: StatsBarProps) {
+export function LabelStatsPanel({ stats, onSearch }: StatsBarProps) {
   const [expanded, setExpanded] = useState(false);
   if (!stats || !stats.labels || stats.labels.label_counts.length === 0) return null;
 
@@ -52,7 +53,11 @@ export function LabelStatsPanel({ stats }: StatsBarProps) {
     <div class="label-stats">
       <h3>Top Labels</h3>
       {visible.map(({ label, count }) => (
-        <div class="label-bar-row" key={label}>
+        <div
+          class="label-bar-row label-bar-row-clickable"
+          key={label}
+          onClick={() => onSearch?.(label)}
+          title={`Search for ${label}`}>
           <span class="label-bar-name">{label}</span>
           <div class="label-bar-track">
             <div
@@ -91,7 +96,7 @@ export function RecentItemCard({ item, onSearch }: RecentItemProps) {
   const displayName = item.display_name || item.name;
   const name = displayName || item.pubkey.slice(0, 12) + "...";
   return (
-    <div class="card recent-item" onClick={() => onSearch(item.pubkey)}>
+    <div class="card recent-item" onClick={(e) => { if (e.target === e.currentTarget) onSearch(item.pubkey); }}>
       <div class="recent-header">
         {item.picture ? (
           <img
@@ -112,7 +117,7 @@ export function RecentItemCard({ item, onSearch }: RecentItemProps) {
           .filter(([_, s]) => s >= 0.3)
           .slice(0, 5)
           .map(([l, score]) => (
-            <LabelPill key={l} label={l} score={score} />
+            <LabelPill key={l} label={l} score={score} onClick={() => onSearch(l)} />
           ))}
       </div>
     </div>
