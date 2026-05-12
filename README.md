@@ -33,7 +33,7 @@ A `CLASSIFICATION_EPOCH` constant (currently `5`) is incremented whenever the sy
 
 | Kind  | Description               | NIP |
 | ----- | ------------------------- | --- |
-| 30580 | Metadata                  | 01  |
+| 0     | Metadata                  | 01  |
 | 1     | Short Text Note           | 10  |
 | 6     | Repost                    | 18  |
 | 7     | Reaction                  | 25  |
