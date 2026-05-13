@@ -1031,13 +1031,15 @@ impl Database {
             .fetch_one(&self.pool)
             .await?;
 
-        // Derive label counts from the indexed classification_labels table
+        // Derive label counts from the indexed classification_labels table.
+        // Start from classifications (filtered by epoch index) then join to labels
+        // via their primary key — avoids scanning all classification_labels rows.
         let label_counts = sqlx::query_as::<_, (String, i64)>(
-            r#"SELECT label, COUNT(*) AS count
-               FROM classification_labels
-               JOIN classifications ON classifications.pubkey = classification_labels.pubkey
+            r#"SELECT classification_labels.label, COUNT(*) AS count
+               FROM classifications
+               JOIN classification_labels ON classification_labels.pubkey = classifications.pubkey
                WHERE classification_labels.score >= ? AND classifications.classification_epoch >= ?
-               GROUP BY label
+               GROUP BY classification_labels.label
                ORDER BY count DESC"#,
         )
         .bind(min_score)
