@@ -110,10 +110,23 @@ pub struct KindCount {
     pub count: i64,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Database {
     pub pool: SqlitePool,
     label_min_score: f64,
+    label_counts_cache: std::sync::Mutex<Option<(Vec<(String, i64)>, f64, i64)>>,
+}
+
+// Database is shared behind Arc, so Clone is manual (pool is Clone).
+// Use Arc<Database> for multi-owner sharing.
+impl Clone for Database {
+    fn clone(&self) -> Self {
+        Self {
+            pool: self.pool.clone(),
+            label_min_score: self.label_min_score,
+            label_counts_cache: std::sync::Mutex::new(None),
+        }
+    }
 }
 
 impl Database {
@@ -139,7 +152,7 @@ impl Database {
         
         let pool = SqlitePool::connect(path.to_str().unwrap()).await?;
         Self::run_migrations(&pool).await?;
-        Ok(Self { pool, label_min_score })
+        Ok(Self { pool, label_min_score, label_counts_cache: std::sync::Mutex::new(None) })
     }
 
     /// Derive the label list from scores: keys where score >= min_score, sorted descending.
@@ -732,6 +745,9 @@ impl Database {
         // Rebuild FTS entry for this profile
         self.rebuild_fts_for_pubkey(pubkey).await?;
 
+        // Invalidate label counts cache — a new classification changes the counts
+        *self.label_counts_cache.lock().unwrap() = None;
+
         Ok(())
     }
 
@@ -1031,10 +1047,19 @@ impl Database {
             .fetch_one(&self.pool)
             .await?;
 
-        // Derive label counts from the indexed classification_labels table.
-        // Start from classifications (filtered by epoch index) then join to labels
-        // via their primary key — avoids scanning all classification_labels rows.
-        let label_counts = sqlx::query_as::<_, (String, i64)>(
+        // Label counts change rarely — only when a new classification is saved.
+        // Cache in memory keyed by (min_score, epoch) to avoid the expensive
+        // 75K-row aggregation on every /api/stats hit.
+        {
+            let cache = self.label_counts_cache.lock().unwrap();
+            if let Some((ref cached_counts, cached_min_score, cached_epoch)) = *cache {
+                if (cached_min_score - min_score).abs() < f64::EPSILON && cached_epoch == epoch {
+                    return Ok((total_profiles, classified_profiles, cached_counts.len() as i64, cached_counts.clone(), images_classified, total_events));
+                }
+            }
+        }
+
+        let label_counts: Vec<(String, i64)> = sqlx::query_as(
             r#"SELECT classification_labels.label, COUNT(*) AS count
                FROM classifications
                JOIN classification_labels ON classification_labels.pubkey = classifications.pubkey
@@ -1048,6 +1073,9 @@ impl Database {
         .await?;
 
         let total_unique_labels = label_counts.len() as i64;
+
+        // Cache the result
+        *self.label_counts_cache.lock().unwrap() = Some((label_counts.clone(), min_score, epoch));
 
         Ok((total_profiles, classified_profiles, total_unique_labels, label_counts, images_classified, total_events))
     }
