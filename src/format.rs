@@ -1,6 +1,10 @@
 use crate::db::Profile;
 use crate::opengraph::OpenGraphData;
 
+/// Maximum characters of event content to include before truncating.
+/// Long-form posts can exceed 50k chars and blow up LLM context windows.
+const CONTENT_MAX_CHARS: usize = 4000;
+
 /// Human-readable names for common Nostr event kinds.
 pub fn kind_name(kind: u16) -> &'static str {
     match kind {
@@ -45,6 +49,7 @@ pub fn describe_profile(p: &Profile) -> String {
 pub fn describe_event(event: &nostr_sdk::Event) -> String {
     let kind = event.kind.as_u16();
     let mut s = String::new();
+    s.push_str(&format!("ID: {}\n", event.id.to_hex()));
     s.push_str(&format!("Kind: {} ({})\n", kind, kind_name(kind)));
     s.push_str(&format!("Author: {}\n", event.pubkey.to_hex()));
 
@@ -54,7 +59,11 @@ pub fn describe_event(event: &nostr_sdk::Event) -> String {
         // Title tag
         if let Some(title) = event.tags.iter().find_map(|t| {
             let vals = t.as_slice();
-            if vals.len() >= 2 && vals[0] == "title" { Some(vals[1].as_str()) } else { None }
+            if vals.len() >= 2 && vals[0] == "title" {
+                Some(vals[1].as_str())
+            } else {
+                None
+            }
         }) {
             s.push_str(&format!("Title: {}\n", title));
         }
@@ -62,16 +71,28 @@ pub fn describe_event(event: &nostr_sdk::Event) -> String {
         // Content warning
         if let Some(cw) = event.tags.iter().find_map(|t| {
             let vals = t.as_slice();
-            if vals.len() >= 2 && vals[0] == "content-warning" { Some(vals[1].as_str()) } else { None }
+            if vals.len() >= 2 && vals[0] == "content-warning" {
+                Some(vals[1].as_str())
+            } else {
+                None
+            }
         }) {
             s.push_str(&format!("Content Warning: {}\n", cw));
         }
 
         // Hashtags
-        let hashtags: Vec<&str> = event.tags.iter().filter_map(|t| {
-            let vals = t.as_slice();
-            if vals.len() >= 2 && vals[0] == "t" { Some(vals[1].as_str()) } else { None }
-        }).collect();
+        let hashtags: Vec<&str> = event
+            .tags
+            .iter()
+            .filter_map(|t| {
+                let vals = t.as_slice();
+                if vals.len() >= 2 && vals[0] == "t" {
+                    Some(vals[1].as_str())
+                } else {
+                    None
+                }
+            })
+            .collect();
         if !hashtags.is_empty() {
             s.push_str(&format!("Hashtags: {}\n", hashtags.join(", ")));
         }
@@ -154,7 +175,24 @@ pub fn describe_event(event: &nostr_sdk::Event) -> String {
     }
 
     if !event.content.is_empty() {
-        s.push_str(&format!("Content: {}\n", event.content));
+        let content_len = event.content.chars().count();
+        if content_len > CONTENT_MAX_CHARS {
+            // Truncate, breaking at the last whitespace before the cutoff
+            let truncated: String = event.content.chars().take(CONTENT_MAX_CHARS).collect();
+            // rfind returns a byte index, which is safe because truncated is a standalone String
+            let break_byte = truncated
+                .rfind(|c: char| c.is_whitespace())
+                .unwrap_or(truncated.len());
+            let snippet = &truncated[..break_byte];
+            s.push_str(&format!(
+                "Content: {}\n[content truncated: {} total chars, showing first {}]\n",
+                snippet,
+                content_len,
+                snippet.chars().count()
+            ));
+        } else {
+            s.push_str(&format!("Content: {}\n", event.content));
+        }
     }
     s.push_str(&format!("Created: {}\n", event.created_at.as_secs()));
 

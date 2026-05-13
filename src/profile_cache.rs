@@ -40,7 +40,7 @@ impl ProfileCache {
         // Fetch kind 0 from relays
         self.fetch_and_cache_metadata(pubkey).await?;
 
-        Ok(self.db.get_profile_by_pubkey(pubkey).await?)
+        self.db.get_profile_by_pubkey(pubkey).await
     }
 
     /// Ensure a profile has metadata, fetching from relays if needed.

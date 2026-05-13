@@ -55,7 +55,7 @@ impl NostrCollector {
                                 batch.push(*event);
                                 if batch.len() >= BATCH_SIZE {
                                     Self::flush_batch(
-                                        &batch, &db, &job_queue, &config, &event_counts, &follower_cache,
+                                        &batch, &db, &job_queue, config, &event_counts, &follower_cache,
                                     ).await;
                                     batch.clear();
                                 }
@@ -67,7 +67,7 @@ impl NostrCollector {
                     _ = flush_tick.tick() => {
                         if !batch.is_empty() {
                             Self::flush_batch(
-                                &batch, &db, &job_queue, &config, &event_counts, &follower_cache,
+                                &batch, &db, &job_queue, config, &event_counts, &follower_cache,
                             ).await;
                             batch.clear();
                         }
@@ -79,7 +79,7 @@ impl NostrCollector {
             // Flush any remaining events before reconnecting
             if !batch.is_empty() {
                 Self::flush_batch(
-                    &batch, &db, &job_queue, &config, &event_counts, &follower_cache,
+                    &batch, &db, &job_queue, config, &event_counts, &follower_cache,
                 ).await;
             }
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;

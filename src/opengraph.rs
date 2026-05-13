@@ -142,7 +142,7 @@ impl OpenGraphCache {
 
     async fn fetch_and_parse(&self, url: &str) -> Result<Option<OpenGraphData>, reqwest::Error> {
         // Validate URL before fetching
-        if let Err(_) = validate_url(url) {
+        if validate_url(url).is_err() {
             return Ok(None);
         }
 

@@ -70,7 +70,7 @@ impl ClassifierError {
                 match openai_err {
                     async_openai::error::OpenAIError::ApiError(_) => true,
                     async_openai::error::OpenAIError::Reqwest(req_err) => {
-                        req_err.status().map_or(false, |s| s.is_server_error())
+                        req_err.status().is_some_and(|s| s.is_server_error())
                             || req_err.is_connect()
                             || req_err.is_timeout()
                     }
@@ -282,6 +282,23 @@ impl Classifier {
                     strict: None,
                 },
             }),
+            ChatCompletionTools::Function(ChatCompletionTool {
+                function: FunctionObject {
+                    name: "summarize_event".to_string(),
+                    description: Some("Get a concise AI-generated summary of a long event's content. Use this when an event's content was truncated (showing '[content truncated: N total chars, showing first M]') and you need to understand what the full content is about. Returns a summary of the main topics, stance, and key points. Only call this for events whose content was explicitly truncated.".to_string()),
+                    parameters: Some(serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "event_id": {
+                                "type": "string",
+                                "description": "The event ID (hex string) whose content was truncated and needs summarization"
+                            }
+                        },
+                        "required": ["event_id"]
+                    })),
+                    strict: None,
+                },
+            }),
         ]);
 
         let request = CreateChatCompletionRequest {
@@ -375,7 +392,7 @@ impl Classifier {
                 // Add assistant message with tool calls
                 request.messages.push(ChatCompletionRequestMessage::Assistant(
                     ChatCompletionRequestAssistantMessage {
-                        content: choice.message.content.clone().map(|c| async_openai::types::chat::ChatCompletionRequestAssistantMessageContent::Text(c)),
+                        content: choice.message.content.clone().map(async_openai::types::chat::ChatCompletionRequestAssistantMessageContent::Text),
                         tool_calls: Some(tool_calls.clone()),
                         ..Default::default()
                     }
@@ -555,7 +572,7 @@ impl Classifier {
             }
         }
 
-        return Err(ClassifierError::Parse(format!("Failed to parse classification from response (first 200 chars): {:.200}", content)));
+        Err(ClassifierError::Parse(format!("Failed to parse classification from response (first 200 chars): {:.200}", content)))
     }
 
     /// Returns (response_text, optional (kind, count) for profile event fetches)
@@ -757,8 +774,64 @@ impl Classifier {
                 }
                 Ok((result, Some((kind, count))))
             }
+            "summarize_event" => {
+                let args: serde_json::Value = serde_json::from_str(arguments)
+                    .map_err(|e| ClassifierError::InvalidToolArgs(format!("Invalid JSON arguments: {}", e)))?;
+                let event_id = args.get("event_id")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| ClassifierError::InvalidToolArgs("Missing event_id".to_string()))?;
+
+                // Fetch the event
+                let event = if let Some(cached) = self.db.get_event(event_id).await? {
+                    nostr_sdk::Event::from_json(&cached.raw_json).ok()
+                } else {
+                    self.nostr.fetch_event_by_id(event_id).await.ok().flatten()
+                };
+
+                let Some(event) = event else {
+                    return Ok((format!("Event not found: {}", event_id), None));
+                };
+
+                let content = &event.content;
+                if content.is_empty() {
+                    return Ok(("(event has no content)".to_string(), None));
+                }
+
+                // Summarize with a lightweight LLM call
+                let summary = self.summarize_content(content).await?;
+                Ok((summary, None))
+            }
             _ => Err(ClassifierError::UnknownTool(name.to_string())),
         }
+    }
+
+    /// Summarize a long piece of content into a concise paragraph.
+    async fn summarize_content(&self, content: &str) -> Result<String, ClassifierError> {
+        let prompt = format!(
+            "Summarize the following Nostr post content concisely (max 400 chars). Focus on: main topic(s), what the author wrote about, their stance/opinion, and any key points relevant to classifying their interests.\n\nContent:\n{}",
+            content
+        );
+
+        let request = CreateChatCompletionRequest {
+            model: self.model.clone(),
+            messages: vec![
+                ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
+                    content: ChatCompletionRequestUserMessageContent::Text(prompt),
+                    name: None,
+                })
+            ],
+            temperature: Some(0.0),
+            max_completion_tokens: Some(300),
+            ..Default::default()
+        };
+
+        let response = self.client.chat().create(request).await?;
+        let summary = response.choices[0]
+            .message
+            .content
+            .as_deref()
+            .unwrap_or("(no summary available)");
+        Ok(summary.to_string())
     }
     
     async fn encode_image(&self, path: &str) -> Result<String, ClassifierError> {
@@ -790,7 +863,7 @@ impl Classifier {
     }
 
 pub async fn describe_image(&self, path: &str) -> Result<String, ClassifierError> {
-        let image_content = format!("data:image/jpeg;base64,{}", self.encode_image(&path).await?);
+        let image_content = format!("data:image/jpeg;base64,{}", self.encode_image(path).await?);
 
         // Detect if this is a video collage (files ending in .video.collage.jpg)
         let is_video_collage = path.contains(".video.collage.");
@@ -903,6 +976,9 @@ IMPORTANT: Before scoring, call the appropriate tools for every reference you en
 3. Call get_opengraph for every non-nostr, non-image, non-video HTTPS URL in event content.
    Shared links reveal interests — someone linking to a political news article is interested in politics, someone linking to a GitHub repo is interested in software development.
    Do NOT call get_opengraph for nostr: URIs (use resolve_nip21) or image/video URLs (use describe_image).
+4. Events may have their content truncated — look for "[content truncated: N total chars, showing first M]" markers.
+   When content is truncated, call summarize_event(event_id) to get an AI summary of the full content.
+   The event ID is shown at the top of each described event as "ID: <hex>". Only summarize when content was explicitly truncated.
 
 LABEL TAXONOMY (score each one):
 {label_list}

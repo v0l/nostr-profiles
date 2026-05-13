@@ -202,11 +202,11 @@ async fn get_profile(
 
     // Get classification if one exists (even if stale — still useful to show)
     if !matches!(status, crate::db::ClassificationStatus::None) {
-        if let Ok(classification) = db.get_classification(&pubkey).await {
+        if let Ok(classification) = db.get_classification(pubkey).await {
             let analyzed_at = sqlx::query_scalar::<_, Option<chrono::DateTime<chrono::Utc>>>(
                 r#"SELECT analyzed_at FROM classifications WHERE pubkey = ?"#,
             )
-            .bind(&pubkey)
+            .bind(pubkey)
             .fetch_one(&db.pool)
             .await
             .ok()

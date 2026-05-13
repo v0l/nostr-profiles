@@ -114,7 +114,7 @@ impl SearchDatabase {
         .fetch_one(&self.db.pool)
         .await
         .ok()
-        .map_or(false, |c| c > 0);
+        .is_some_and(|c| c > 0);
 
         if !has_classification {
             return None;
@@ -179,7 +179,7 @@ impl NostrDatabase for SearchDatabase {
                 }
             }
 
-            let limit = filter.limit.unwrap_or(100) as usize;
+            let limit = filter.limit.unwrap_or(100);
             let authors = filter.authors.as_ref();
             let search = filter.search.as_ref();
 

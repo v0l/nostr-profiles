@@ -207,7 +207,7 @@ fn stitch_collage(frame_paths: &[String]) -> DynamicImage {
     // Compute grid dimensions to make a roughly square collage
     let n = images.len() as u32;
     let cols = (n as f64).sqrt().ceil() as u32;
-    let rows = (n + cols - 1) / cols;
+    let rows = n.div_ceil(cols);
 
     // Scale all frames to the same size — use the smallest frame's dimensions
     let cell_w = images.iter().map(|i| i.width()).min().unwrap_or(MAX_FRAME_DIM as u32);

@@ -229,7 +229,7 @@ impl Database {
                         r#"INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time)
                            VALUES (?, ?, TRUE, ?, -1)"#
                     )
-                    .bind(init.version as i64)
+                    .bind(init.version)
                     .bind(&init.description)
                     .bind(init.checksum.as_ref() as &[u8])
                     .execute(pool)
