@@ -22,6 +22,7 @@ pub struct AppState {
     pub relay: LocalRelay,
     pub job_queue: Arc<JobQueue>,
     pub db_path: String,
+    pub chat_log_dir: String,
 }
 
 #[derive(Serialize)]
@@ -115,8 +116,8 @@ struct LabelSearchQuery {
     limit: Option<i64>,
 }
 
-pub async fn serve(db: Arc<Database>, relay: LocalRelay, job_queue: Arc<JobQueue>, port: u16, db_path: String) {
-    let state = AppState { db, relay, job_queue, db_path };
+pub async fn serve(db: Arc<Database>, relay: LocalRelay, job_queue: Arc<JobQueue>, port: u16, db_path: String, chat_log_dir: String) {
+    let state = AppState { db, relay, job_queue, db_path, chat_log_dir };
 
     let app = Router::new()
         .route("/", get(root_handler))
@@ -126,6 +127,7 @@ pub async fn serve(db: Arc<Database>, relay: LocalRelay, job_queue: Arc<JobQueue
         .route("/api/search/label", get(search_by_label))
         .route("/api/stats", get(get_stats))
         .route("/api/download-db", get(download_db))
+        .route("/api/chat-logs/{pubkey}", get(get_chat_log))
         .fallback_service(ServeDir::new("dashboard/dist"))
         .with_state(state);
 
@@ -384,6 +386,56 @@ async fn download_db(State(state): State<AppState>) -> impl IntoResponse {
         Err(e) => {
             tracing::error!("Failed to read database for download: {}", e);
             (StatusCode::INTERNAL_SERVER_ERROR, "Failed to read database").into_response()
+        }
+    }
+}
+
+/// Download the most recent chat log for a pubkey as JSON.
+async fn get_chat_log(
+    State(state): State<AppState>,
+    axum::extract::Path(pubkey): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    let dir = std::path::Path::new(&state.chat_log_dir).join(&pubkey);
+
+    let mut entries = match tokio::fs::read_dir(&dir).await {
+        Ok(rd) => rd,
+        Err(_) => return (StatusCode::NOT_FOUND, "No chat logs found for this pubkey").into_response(),
+    };
+
+    // Collect all .json files
+    let mut files: Vec<String> = Vec::new();
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.ends_with(".json") {
+            files.push(name);
+        }
+    }
+
+    if files.is_empty() {
+        return (StatusCode::NOT_FOUND, "No chat logs found for this pubkey").into_response();
+    }
+
+    files.sort();
+    // Return the latest (last alphabetically, since timestamps sort correctly
+    // with colons replaced by hyphens)
+    let latest = files.last().unwrap();
+    let file_path = dir.join(latest);
+
+    match tokio::fs::read_to_string(&file_path).await {
+        Ok(json) => {
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(
+                    header::CONTENT_DISPOSITION,
+                    format!("attachment; filename=\"{}_{}\"", pubkey, latest),
+                )
+                .body(axum::body::Body::from(json))
+                .unwrap()
+        }
+        Err(e) => {
+            tracing::error!("Failed to read chat log {}: {}", file_path.display(), e);
+            (StatusCode::INTERNAL_SERVER_ERROR, "Failed to read chat log").into_response()
         }
     }
 }

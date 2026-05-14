@@ -91,8 +91,9 @@ async fn main() -> Result<()> {
     let db_clone = Arc::clone(&db);
     let job_queue_clone = Arc::clone(&job_queue);
     let db_path = config.database.path.clone();
+    let chat_log_dir = config.chat_logs.dir.clone();
     let server_handle = tokio::spawn(async move {
-        http_server::serve(db_clone, relay, job_queue_clone, 3000, db_path).await;
+        http_server::serve(db_clone, relay, job_queue_clone, 3000, db_path, chat_log_dir).await;
     });
 
     // Start job queue workers BEFORE enqueuing — otherwise the channel fills

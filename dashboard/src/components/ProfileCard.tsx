@@ -126,6 +126,11 @@ export function ProfileCard({ profile, onSearch }: ProfileCardProps) {
           <span class="author-name">{displayName || "Unknown"}</span>
           {nip05 && <span class="nip05">{nip05}</span>}
           <span class="pubkey">{pubkey}</span>
+          {hasClassification && (
+            <a href={`/api/chat-logs/${encodeURIComponent(pubkey)}`} class="chat-log-link" download>
+              ⬇ Chat Log
+            </a>
+          )}
         </div>
       </div>
       {about && <div class="about">{about}</div>}
