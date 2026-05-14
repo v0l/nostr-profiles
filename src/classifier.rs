@@ -1,3 +1,4 @@
+use crate::chat_log::ChatLogCollector;
 use crate::config::LlmConfig;
 use crate::db::Database;
 use crate::image_cache::ImageCache;
@@ -111,6 +112,7 @@ pub struct Classifier {
     label_min_score: f64,
     classify_timeout: Duration,
     tool_call_timeout: Duration,
+    chat_log_dir: String,
 }
 
 impl Classifier {
@@ -118,7 +120,7 @@ impl Classifier {
         &self.profile_cache
     }
 
-    pub fn new(config: &LlmConfig, nostr: NostrClient, profile_cache: ProfileCache, image_cache: ImageCache, og_cache: OpenGraphCache, db: Arc<Database>, label_taxonomy: Vec<String>, label_min_score: f64, tool_call_timeout: Duration) -> Self {
+    pub fn new(config: &LlmConfig, nostr: NostrClient, profile_cache: ProfileCache, image_cache: ImageCache, og_cache: OpenGraphCache, db: Arc<Database>, label_taxonomy: Vec<String>, label_min_score: f64, tool_call_timeout: Duration, chat_log_dir: String) -> Self {
         let openai_config = OpenAIConfig::new()
             .with_api_base(&config.api_base_url)
             .with_api_key(&config.api_key);
@@ -145,6 +147,7 @@ impl Classifier {
             label_min_score,
             classify_timeout,
             tool_call_timeout,
+            chat_log_dir,
         }
     }
 
@@ -153,6 +156,7 @@ impl Classifier {
         pubkey: &str,
         context: &str,
     ) -> Result<ClassifyResult, ClassifierError> {
+        let mut collector = ChatLogCollector::new(pubkey);
         let prompt = self.build_classification_prompt();
 
         let messages: Vec<ChatCompletionRequestMessage> = vec![
@@ -314,19 +318,24 @@ impl Classifier {
         let pubkey_owned = pubkey.to_string();
         let result = tokio::time::timeout(
             classify_timeout,
-            self.call_with_tool_handling(request, &pubkey_owned),
+            self.call_with_tool_handling(request, &pubkey_owned, &mut collector),
         )
         .await
         .map_err(|_| {
             ClassifierError::Timeout(
                 classify_timeout.as_secs()
             )
-        })??;
+        })?;
+
+        // Save chat log to disk (best-effort, don't fail classification)
+        if let Err(e) = crate::chat_log::write_log(&collector.finalize(), &self.chat_log_dir).await {
+            tracing::warn!("Failed to write chat log for {}: {}", pubkey, e);
+        }
         
-        Ok(result)
+        result
     }
 
-    async fn call_with_tool_handling(&self, mut request: CreateChatCompletionRequest, pubkey: &str) -> Result<ClassifyResult, ClassifierError> {
+    async fn call_with_tool_handling(&self, mut request: CreateChatCompletionRequest, pubkey: &str, collector: &mut ChatLogCollector) -> Result<ClassifyResult, ClassifierError> {
         let mut max_iterations = 15;
         let mut tool_event_counts: std::collections::HashMap<i64, usize> = std::collections::HashMap::new();
 
@@ -343,6 +352,15 @@ impl Classifier {
 
             let response = self.client.chat().create(request.clone()).await?;
             let choice = &response.choices[0];
+
+            // Record this LLM call
+            if let (Ok(req_json), Ok(resp_json)) = (
+                serde_json::to_value(request.clone()),
+                serde_json::to_value(&response),
+            ) {
+                collector.record("classify", req_json, resp_json);
+            }
+
             let finish_reason = format!("{:?}", choice.finish_reason);
             let content = choice.message.content.as_deref().unwrap_or("");
             let has_content = !content.is_empty();
@@ -411,7 +429,7 @@ impl Classifier {
                     info!("Tool call: {}({})", name, arguments);
                     let (result, event_info) = tokio::time::timeout(
                         self.tool_call_timeout,
-                        self.call_tool(&name, &arguments, pubkey),
+                        self.call_tool(&name, &arguments, pubkey, collector),
                     )
                     .await
                     .map_err(|_| ClassifierError::ToolTimeout { tool: name.clone(), timeout: self.tool_call_timeout.as_secs() })?
@@ -465,6 +483,15 @@ impl Classifier {
         info!("Max iterations reached, making final request without tools");
         request.tools = None;
         let response = self.client.chat().create(request.clone()).await?;
+
+        // Record this LLM call
+        if let (Ok(req_json), Ok(resp_json)) = (
+            serde_json::to_value(request.clone()),
+            serde_json::to_value(&response),
+        ) {
+            collector.record("classify", req_json, resp_json);
+        }
+
         let content = response.choices[0].message.content.as_deref().unwrap_or("");
         self.parse_classification(content).map(|c| make_result(c, tool_event_counts))
     }
@@ -575,8 +602,7 @@ impl Classifier {
         Err(ClassifierError::Parse(format!("Failed to parse classification from response (first 200 chars): {:.200}", content)))
     }
 
-    /// Returns (response_text, optional (kind, count) for profile event fetches)
-    async fn call_tool(&self, name: &str, arguments: &str, pubkey: &str) -> Result<(String, Option<(i64, usize)>), ClassifierError> {
+    async fn call_tool(&self, name: &str, arguments: &str, pubkey: &str, collector: &mut ChatLogCollector) -> Result<(String, Option<(i64, usize)>), ClassifierError> {
         match name {
             "get_event" => {
                 let args: serde_json::Value = serde_json::from_str(arguments)
@@ -631,7 +657,7 @@ impl Classifier {
                         match self.db.get_image_description(&hash).await? {
                             Some(cached) => Ok((cached, None)),
                             None => {
-                                let desc = self.describe_image(&path).await?;
+                                let desc = self.describe_image(&path, collector).await?;
                                 let _ = self.db.save_image_description(&hash, &desc).await;
                                 Ok((desc, None))
                             }
@@ -798,7 +824,7 @@ impl Classifier {
                 }
 
                 // Summarize with a lightweight LLM call
-                let summary = self.summarize_content(content).await?;
+                let summary = self.summarize_content(content, collector).await?;
                 Ok((summary, None))
             }
             _ => Err(ClassifierError::UnknownTool(name.to_string())),
@@ -806,7 +832,7 @@ impl Classifier {
     }
 
     /// Summarize a long piece of content into a concise paragraph.
-    async fn summarize_content(&self, content: &str) -> Result<String, ClassifierError> {
+    async fn summarize_content(&self, content: &str, collector: &mut ChatLogCollector) -> Result<String, ClassifierError> {
         let prompt = format!(
             "Summarize the following Nostr post content concisely (max 400 chars). Focus on: main topic(s), what the author wrote about, their stance/opinion, and any key points relevant to classifying their interests.\n\nContent:\n{}",
             content
@@ -825,7 +851,16 @@ impl Classifier {
             ..Default::default()
         };
 
-        let response = self.client.chat().create(request).await?;
+        let response = self.client.chat().create(request.clone()).await?;
+
+        // Record this LLM call
+        if let (Ok(req_json), Ok(resp_json)) = (
+            serde_json::to_value(request),
+            serde_json::to_value(&response),
+        ) {
+            collector.record("summarize", req_json, resp_json);
+        }
+
         let summary = response.choices[0]
             .message
             .content
@@ -862,7 +897,7 @@ impl Classifier {
         Ok(STANDARD.encode(&jpeg_bytes))
     }
 
-pub async fn describe_image(&self, path: &str) -> Result<String, ClassifierError> {
+pub async fn describe_image(&self, path: &str, collector: &mut ChatLogCollector) -> Result<String, ClassifierError> {
         let image_content = format!("data:image/jpeg;base64,{}", self.encode_image(path).await?);
 
         // Detect if this is a video collage (files ending in .video.collage.jpg)
@@ -895,7 +930,30 @@ pub async fn describe_image(&self, path: &str) -> Result<String, ClassifierError
             ..Default::default()
         };
 
-        let response = self.client.chat().create(request).await?;
+        let response = self.client.chat().create(request.clone()).await?;
+
+        // Record this LLM call (but strip the base64 image data from the request to keep logs manageable)
+        if let (Ok(mut req_json), Ok(resp_json)) = (
+            serde_json::to_value(request),
+            serde_json::to_value(&response),
+        ) {
+            // Replace large base64 image data with a placeholder
+            if let Some(msgs) = req_json.get_mut("messages").and_then(|m| m.as_array_mut()) {
+                for msg in msgs.iter_mut() {
+                    if let Some(content) = msg.get_mut("content").and_then(|c| c.as_array_mut()) {
+                        for part in content.iter_mut() {
+                            if let Some(image_url) = part.get_mut("image_url").and_then(|i| i.get_mut("url")).and_then(|u| u.as_str()) {
+                                if image_url.starts_with("data:image/") {
+                                    *part.get_mut("image_url").unwrap().get_mut("url").unwrap() = serde_json::Value::String("[base64 image data omitted]".to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            collector.record("describe_image", req_json, resp_json);
+        }
+
         let content = response.choices[0].message.content.as_deref().unwrap_or("No description available");
         
         Ok(content.to_string())

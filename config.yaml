@@ -2,11 +2,11 @@ llm:
   api_base_url: "http://localhost:8001/v1"
   model: "qwen3.5:122b"
   api_key: ""
-  timeout_secs: 120            # per-request HTTP timeout
-  classify_timeout_secs: 300   # overall timeout for a single classification (all LLM + tool calls)
+  timeout_secs: 120 # per-request HTTP timeout
+  classify_timeout_secs: 300 # overall timeout for a single classification (all LLM + tool calls)
 
 nostr:
-  nsec: ""  # optional: nsec1... or hex secret key for signing
+  nsec: "" # optional: nsec1... or hex secret key for signing
   relays:
     - "wss://relay.damus.io"
     - "wss://nostr.bitcoiner.social"
@@ -25,8 +25,8 @@ processing:
   max_retries: 3
   image_download_timeout_secs: 30
   min_followers: 3
-  job_timeout_secs: 600           # overall timeout for a single classification job (fetch + classify + save)
-  tool_call_timeout_secs: 30      # timeout for individual LLM tool calls (get_event, get_profile, etc.)
+  job_timeout_secs: 600 # overall timeout for a single classification job (fetch + classify + save)
+  tool_call_timeout_secs: 30 # timeout for individual LLM tool calls (get_event, get_profile, etc.)
 
 database:
   path: "nostr_classify.db"
@@ -38,6 +38,9 @@ image_cache:
 logging:
   level: "info"
 
+chat_logs:
+  dir: "chat_logs" # directory to store per-pubkey LLM chat logs as JSON files
+
 labels:
-  taxonomy_file: null  # path to a text file with one label per line, or null for built-in set
-  min_score: 0.4       # minimum score (0.0-1.0) for a label to be included
+  taxonomy_file: null # path to a text file with one label per line, or null for built-in set
+  min_score: 0.4 # minimum score (0.0-1.0) for a label to be included

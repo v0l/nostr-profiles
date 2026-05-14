@@ -1,3 +1,4 @@
+mod chat_log;
 mod classifier;
 mod config;
 mod count_cache;
@@ -72,6 +73,7 @@ async fn main() -> Result<()> {
         crate::config::load_label_taxonomy(config.labels.taxonomy_file.as_deref()),
         config.labels.min_score,
         std::time::Duration::from_secs(config.processing.tool_call_timeout_secs),
+        config.chat_logs.dir.clone(),
     );
     tracing::info!("Classifier initialized with model {} and {} labels (min_score={})",
         config.llm.model,
@@ -88,8 +90,9 @@ async fn main() -> Result<()> {
     // Start HTTP server with the search relay on the same port
     let db_clone = Arc::clone(&db);
     let job_queue_clone = Arc::clone(&job_queue);
+    let db_path = config.database.path.clone();
     let server_handle = tokio::spawn(async move {
-        http_server::serve(db_clone, relay, job_queue_clone, 3000).await;
+        http_server::serve(db_clone, relay, job_queue_clone, 3000, db_path).await;
     });
 
     // Start job queue workers BEFORE enqueuing — otherwise the channel fills

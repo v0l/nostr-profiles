@@ -1,6 +1,7 @@
 /target
 /nostr_classify.db
 /nostr_classify.db-journal
+/chat_logs/
 .idea/
 collage.jpg
 dashboard/node_modules/

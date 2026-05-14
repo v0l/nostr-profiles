@@ -8,6 +8,7 @@ pub struct Config {
     pub processing: ProcessingConfig,
     pub database: DatabaseConfig,
     pub image_cache: ImageCacheConfig,
+    pub chat_logs: ChatLogConfig,
     pub logging: LoggingConfig,
     pub labels: LabelsConfig,
 }
@@ -57,6 +58,12 @@ pub struct ImageCacheConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatLogConfig {
+    /// Directory to write classification chat logs (one JSON file per classification run).
+    pub dir: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoggingConfig {
     pub level: String,
 }
@@ -79,9 +86,10 @@ impl Config {
             .set_default("processing.job_timeout_secs", 600)?
             .set_default("processing.tool_call_timeout_secs", 30)?
             .set_default("labels.min_score", 0.4)?
+            .set_default("chat_logs.dir", "chat_logs")?
             .add_source(config::File::from(path.as_ref()))
             .build()?;
-        
+
         config.try_deserialize()
     }
 }
@@ -110,7 +118,6 @@ pub const BUILTIN_LABEL_TAXONOMY: &[&str] = &[
     "data-science",
     "embedded-systems",
     "robotics",
-
     // Bitcoin & Crypto
     "bitcoin",
     "bitcoin-mining",
@@ -121,7 +128,6 @@ pub const BUILTIN_LABEL_TAXONOMY: &[&str] = &[
     "defi",
     "trading",
     "nft",
-
     // Privacy & Freedom
     "privacy-advocate",
     "censorship-resistance",
@@ -129,7 +135,6 @@ pub const BUILTIN_LABEL_TAXONOMY: &[&str] = &[
     "cypherpunk",
     "decentralization",
     "agorism",
-
     // Content Creation
     "writer",
     "blogger",
@@ -141,7 +146,6 @@ pub const BUILTIN_LABEL_TAXONOMY: &[&str] = &[
     "streamer",
     "memer",
     "newsletter",
-
     // Professional
     "entrepreneur",
     "investor",
@@ -154,7 +158,6 @@ pub const BUILTIN_LABEL_TAXONOMY: &[&str] = &[
     "doctor",
     "lawyer",
     "farmer",
-
     // Lifestyle & Interests
     "gaming",
     "fitness",
@@ -206,7 +209,6 @@ pub const BUILTIN_LABEL_TAXONOMY: &[&str] = &[
     "cinema",
     "tattoos",
     "foraging",
-
     // Politics & Society
     "libertarian",
     "anarchist",
@@ -218,20 +220,17 @@ pub const BUILTIN_LABEL_TAXONOMY: &[&str] = &[
     "socialism",
     "nationalism",
     "anti-authoritarian",
-
     // Community
     "community-builder",
     "event-organizer",
     "moderator",
     "mutual-aid",
-
     // Content Quality
     "nsfw",
     "bot",
     "spam",
     "troll",
     "scam",
-
     // Language
     "english",
     "japanese",
@@ -267,10 +266,16 @@ pub fn load_label_taxonomy(taxonomy_file: Option<&str>) -> Vec<String> {
             if !labels.is_empty() {
                 return labels;
             }
-            tracing::warn!("Taxonomy file {} was empty or had no valid labels, using built-in set", path);
+            tracing::warn!(
+                "Taxonomy file {} was empty or had no valid labels, using built-in set",
+                path
+            );
         } else {
             tracing::warn!("Could not read taxonomy file {}, using built-in set", path);
         }
     }
-    BUILTIN_LABEL_TAXONOMY.iter().map(|s| s.to_string()).collect()
+    BUILTIN_LABEL_TAXONOMY
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
 }

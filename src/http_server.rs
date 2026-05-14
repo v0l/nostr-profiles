@@ -21,6 +21,7 @@ pub struct AppState {
     pub db: Arc<Database>,
     pub relay: LocalRelay,
     pub job_queue: Arc<JobQueue>,
+    pub db_path: String,
 }
 
 #[derive(Serialize)]
@@ -114,8 +115,8 @@ struct LabelSearchQuery {
     limit: Option<i64>,
 }
 
-pub async fn serve(db: Arc<Database>, relay: LocalRelay, job_queue: Arc<JobQueue>, port: u16) {
-    let state = AppState { db, relay, job_queue };
+pub async fn serve(db: Arc<Database>, relay: LocalRelay, job_queue: Arc<JobQueue>, port: u16, db_path: String) {
+    let state = AppState { db, relay, job_queue, db_path };
 
     let app = Router::new()
         .route("/", get(root_handler))
@@ -124,6 +125,7 @@ pub async fn serve(db: Arc<Database>, relay: LocalRelay, job_queue: Arc<JobQueue
         .route("/api/search", get(search))
         .route("/api/search/label", get(search_by_label))
         .route("/api/stats", get(get_stats))
+        .route("/api/download-db", get(download_db))
         .fallback_service(ServeDir::new("dashboard/dist"))
         .with_state(state);
 
@@ -356,4 +358,32 @@ fn derive_ws_accept_key(key: &[u8]) -> String {
     sha1.update(key);
     sha1.update(WS_GUID);
     base64::engine::general_purpose::STANDARD.encode(sha1.finalize())
+}
+
+/// Download the SQLite database file.
+async fn download_db(State(state): State<AppState>) -> impl IntoResponse {
+    match tokio::fs::read(&state.db_path).await {
+        Ok(data) => {
+            let filename = std::path::Path::new(&state.db_path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("nostr_classify.db");
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(
+                    header::CONTENT_TYPE,
+                    "application/vnd.sqlite3",
+                )
+                .header(
+                    header::CONTENT_DISPOSITION,
+                    format!("attachment; filename=\"{}\"", filename),
+                )
+                .body(axum::body::Body::from(data))
+                .unwrap()
+        }
+        Err(e) => {
+            tracing::error!("Failed to read database for download: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, "Failed to read database").into_response()
+        }
+    }
 }
