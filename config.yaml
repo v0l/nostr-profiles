@@ -27,6 +27,11 @@ processing:
   min_followers: 3
   job_timeout_secs: 600 # overall timeout for a single classification job (fetch + classify + save)
   tool_call_timeout_secs: 30 # timeout for individual LLM tool calls (get_event, get_profile, etc.)
+  # ASR (speech-to-text) for transcribing audio from video files. Optional.
+  # Connects to a Wyoming protocol server (e.g. wyoming-faster-whisper).
+  asr:
+    uri: "tcp://127.0.0.1:10300"
+  #  language: "en"  # optional, server may auto-detect
 
 database:
   path: "nostr_classify.db"

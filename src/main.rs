@@ -1,3 +1,4 @@
+mod asr;
 mod chat_log;
 mod classifier;
 mod config;
@@ -56,7 +57,7 @@ async fn main() -> Result<()> {
     nostr.connect().await;
     tracing::info!("Nostr client connected to {} relays", config.nostr.relays.len());
 
-    let image_cache = ImageCache::new(&config.image_cache.dir)?;
+    let image_cache = ImageCache::new(&config.image_cache.dir, config.processing.asr.clone())?;
     tracing::info!("Image cache initialized at {}", config.image_cache.dir);
 
     let profile_cache = ProfileCache::new(db.clone(), nostr.clone(), 7);

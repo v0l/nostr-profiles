@@ -21,7 +21,10 @@ nostr-database = "0.44.0"
 nostr-relay-builder = "0.44.0"
 nostr-sdk = "0.44.1"
 regex = "1.12.3"
-reqwest = { version = "0.13.3", default-features = false, features = ["json", "__rustls-aws-lc-rs"] }
+reqwest = { version = "0.13.3", default-features = false, features = [
+  "json",
+  "__rustls-aws-lc-rs",
+] }
 ring = "0.17"
 rustls = { version = "0.23", features = ["ring"] }
 serde = { version = "1.0.228", features = ["derive"] }

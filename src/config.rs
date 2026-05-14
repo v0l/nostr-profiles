@@ -44,6 +44,19 @@ pub struct ProcessingConfig {
     pub job_timeout_secs: u64,
     /// Timeout in seconds for individual LLM tool calls (get_event, get_profile, etc.) (default: 30)
     pub tool_call_timeout_secs: u64,
+    /// ASR (speech-to-text) configuration for transcribing audio from video files.
+    /// When set, downloaded videos will be transcribed via a Wyoming protocol server.
+    pub asr: Option<AsrConfig>,
+}
+
+/// ASR (Automatic Speech Recognition) configuration for transcribing audio from video files.
+/// Connects to a Wyoming protocol server (e.g. wyoming-faster-whisper) via TCP.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AsrConfig {
+    /// Wyoming server URI, e.g. "tcp://127.0.0.1:10300"
+    pub uri: String,
+    /// Language to request for transcription, e.g. "en" (optional, server may auto-detect)
+    pub language: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

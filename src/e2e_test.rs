@@ -119,7 +119,7 @@ async fn e2e_classify_reaction_infers_interest() -> Result<()> {
     nostr.connect().await;
 
     let image_cache_dir = tempfile::tempdir()?;
-    let image_cache = ImageCache::new(image_cache_dir.path().to_str().unwrap())?;
+    let image_cache = ImageCache::new(image_cache_dir.path().to_str().unwrap(), None)?;
     let profile_cache = ProfileCache::new(db.clone(), nostr.clone(), 7);
     let og_cache = crate::opengraph::OpenGraphCache::new(128);
 
@@ -129,6 +129,7 @@ async fn e2e_classify_reaction_infers_interest() -> Result<()> {
         crate::config::load_label_taxonomy(config.labels.taxonomy_file.as_deref()),
         config.labels.min_score,
         std::time::Duration::from_secs(config.processing.tool_call_timeout_secs),
+        config.chat_logs.dir.clone(),
     );
 
     let result = classifier.classify(&alice_pk, &context).await?;
@@ -188,6 +189,126 @@ async fn test_reaction_references_cached_event() -> Result<()> {
     let cached = db.get_event(&e_tag).await?.unwrap();
     let cached_event = nostr_sdk::Event::from_json(&cached.raw_json)?;
     assert_eq!(cached_event.content, "Bitcoin is the future of money");
+
+    Ok(())
+}
+
+/// End-to-end test: downloads a video, runs ASR transcription via Wyoming, then classifies
+/// a profile that posted the video. The transcript should inform the classification.
+///
+/// Requires a Wyoming STT server running at the URI configured in config.yaml.
+/// Run with: cargo test e2e_asr_video -- --ignored --nocapture
+#[tokio::test]
+#[ignore]
+async fn e2e_asr_video_transcribe_and_classify() -> Result<()> {
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("Failed to install rustls crypto provider");
+
+    let config = Config::load("config.yaml")?;
+    let asr_config = config
+        .processing
+        .asr
+        .as_ref()
+        .expect("ASR must be configured in config.yaml for this test");
+
+    println!("ASR config: uri={}, lang={:?}", asr_config.uri, asr_config.language);
+
+    // --- Step 1: Download video, extract collage + ASR transcript ---
+    let cache_dir = tempfile::tempdir()?;
+    let image_cache =
+        ImageCache::new(cache_dir.path().to_str().unwrap(), Some(asr_config.clone()))?;
+
+    let video_url = "https://nostr.download/e8d6ff9dba138146f8d3cd26ea36a736093bbf99f6c9f8eff19bcd182c0f437c.mp4";
+    println!("Downloading video: {}", video_url);
+
+    let (path, _hash) = image_cache.download(video_url).await?.expect("Failed to download video");
+    println!("Cached collage at: {}", path);
+    assert!(path.contains(".video.collage.jpg"), "expected collage path, got {path}");
+    assert!(
+        std::path::Path::new(&path).exists(),
+        "collage file should exist at {path}"
+    );
+
+    // Check transcript exists (may fail if Wyoming server isn't running)
+    let transcript_path = path.replace(".video.collage.jpg", ".video.transcript.txt");
+    let transcript = match std::fs::read_to_string(&transcript_path) {
+        Ok(t) => t.trim().to_string(),
+        Err(e) => {
+            eprintln!("ASR transcript not found at {transcript_path}: {e}");
+            eprintln!("Skipping classification — Wyoming STT server may not be running.");
+            return Ok(());
+        }
+    };
+    println!("ASR transcript ({} chars): {}", transcript.len(), &transcript[..transcript.len().min(500)]);
+    assert!(!transcript.is_empty(), "transcript should not be empty");
+
+    // --- Step 2: Classify (best-effort, may time out on slow LLMs) ---
+    let db_dir = tempfile::tempdir()?;
+    let db = Arc::new(
+        Database::new(
+            db_dir.path().join("test.db").to_str().unwrap(),
+            config.labels.min_score,
+        )
+        .await?,
+    );
+
+    let alice = nostr_sdk::Keys::generate();
+    let alice_meta = make_event(
+        &alice, 0,
+        &serde_json::json!({"name": "Alice", "about": "I post videos"}).to_string(),
+        vec![], 1699990000,
+    );
+    let imeta_tag = nostr_sdk::Tag::parse([
+        "imeta",
+        &format!("url {}", video_url),
+        "m video/mp4",
+    ]).unwrap();
+    let video_post = make_event(
+        &alice, 22, "Check out this clip!",
+        vec![imeta_tag], 1700000000,
+    );
+
+    db.cache_event(&alice_meta).await?;
+    db.cache_event(&video_post).await?;
+
+    let alice_pk = alice.public_key.to_hex();
+    let events = db.get_profile_events(&alice_pk, 50).await?;
+    let profile = db.get_profile_details(&alice_pk).await.ok();
+    let context = build_context(&profile, &events, &None);
+    println!("Context ({}) chars", context.len());
+
+    let nostr = NostrClient::new(&config.nostr.relays, config.nostr.nsec.as_deref()).await?;
+    nostr.connect().await;
+
+    let profile_cache = ProfileCache::new(db.clone(), nostr.clone(), 7);
+    let og_cache = crate::opengraph::OpenGraphCache::new(128);
+
+    let classifier = Classifier::new(
+        &config.llm,
+        nostr, profile_cache, image_cache, og_cache, db,
+        crate::config::load_label_taxonomy(config.labels.taxonomy_file.as_deref()),
+        config.labels.min_score,
+        std::time::Duration::from_secs(config.processing.tool_call_timeout_secs),
+        config.chat_logs.dir.clone(),
+    );
+
+    match classifier.classify(&alice_pk, &context).await {
+        Ok(result) => {
+            println!("=== Classification ===");
+            println!("Bio: {}", result.classification.bio);
+            println!("Confidence: {:.2}", result.classification.confidence);
+            let mut sorted: Vec<_> = result.classification.scores.iter().collect();
+            sorted.sort_by(|a, b| b.1.partial_cmp(a.1).unwrap());
+            for (label, score) in sorted.iter().take(15) {
+                println!("  {}: {:.2}", label, score);
+            }
+            assert!(!result.classification.bio.is_empty(), "bio should not be empty");
+        }
+        Err(e) => {
+            eprintln!("Classification failed (non-critical for ASR test): {e}");
+        }
+    }
 
     Ok(())
 }

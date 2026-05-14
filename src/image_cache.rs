@@ -1,10 +1,11 @@
+use crate::config::AsrConfig;
 use anyhow::Result;
 use reqwest::Client;
 use std::path::PathBuf;
 use std::sync::Arc;
 use reqwest::header::HeaderMap;
 use sha2::{Digest, Sha256};
-use tracing::info;
+use tracing::{info, warn};
 use std::collections::HashMap;
 use std::sync::Mutex as StdMutex;
 
@@ -13,10 +14,11 @@ pub struct ImageCache {
     cache_dir: Arc<PathBuf>,
     client: Client,
     in_flight: Arc<StdMutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    asr: Option<AsrConfig>,
 }
 
 impl ImageCache {
-    pub fn new(cache_dir: &str) -> Result<Self> {
+    pub fn new(cache_dir: &str, asr: Option<AsrConfig>) -> Result<Self> {
         let cache_dir = Arc::new(PathBuf::from(cache_dir));
         std::fs::create_dir_all(cache_dir.as_ref())?;
 
@@ -30,6 +32,7 @@ impl ImageCache {
                 .default_headers(headers)
                 .build()?,
             in_flight: Arc::new(StdMutex::new(HashMap::new())),
+            asr,
         })
     }
 
@@ -99,7 +102,7 @@ impl ImageCache {
         }
     }
 
-    /// Download a video, extract a collage of frames, and cache the result.
+    /// Download a video, extract a collage of frames, optionally transcribe audio via ASR, and cache the result.
     async fn download_video(&self, url: &str, url_hash: &Option<String>) -> Result<Option<(String, String)>> {
         // Check if collage already exists by URL hash
         if let Some(hash) = url_hash {
@@ -129,9 +132,38 @@ impl ImageCache {
         // Save video to temp file
         let video_path = self.cache_dir.join(format!("{content_hash}.video.tmp"));
         tokio::fs::write(&video_path, &bytes).await?;
+        let video_path_str = video_path.to_string_lossy().to_string();
+
+        // Try ASR transcription first if configured (video file is still available)
+        let transcript = if let Some(ref asr_config) = self.asr {
+            eprintln!("[asr] Starting transcription via {} for {}", asr_config.uri, video_path_str);
+            match crate::asr::transcribe_video(&video_path_str, asr_config).await {
+                Ok(text) if !text.trim().is_empty() => {
+                    info!("ASR transcript ({} chars): {:.200}", text.len(), text);
+                    Some(text)
+                }
+                Ok(_text) => {
+                    eprintln!("[asr] warning: empty transcript");
+                    None
+                }
+                Err(e) => {
+                    eprintln!("[asr] transcription failed: {:#}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        // Save transcript if we got one
+        if let Some(ref text) = transcript {
+            let transcript_path = self.cache_dir.join(format!("{content_hash}.video.transcript.txt"));
+            if let Err(e) = tokio::fs::write(&transcript_path, text).await {
+                warn!("Failed to save transcript: {}", e);
+            }
+        }
 
         // Extract collage (blocking operation, spawn on blocking thread)
-        let video_path_str = video_path.to_string_lossy().to_string();
         let collage_result = tokio::task::spawn_blocking(move || {
             crate::video::extract_video_collage(&video_path_str)
         }).await??;
@@ -201,7 +233,7 @@ mod tests {
     #[tokio::test]
     async fn test_image_cache_creation() {
         let temp_dir = TempDir::new().unwrap();
-        let cache = ImageCache::new(temp_dir.path().to_str().unwrap()).unwrap();
+        let cache = ImageCache::new(temp_dir.path().to_str().unwrap(), None).unwrap();
         
         assert!(cache.cache_dir.as_ref().exists());
     }
@@ -234,7 +266,7 @@ mod tests {
     #[tokio::test]
     async fn test_image_cache_download_skips_existing() {
         let temp_dir = TempDir::new().unwrap();
-        let cache = ImageCache::new(temp_dir.path().to_str().unwrap()).unwrap();
+        let cache = ImageCache::new(temp_dir.path().to_str().unwrap(), None).unwrap();
         
         // Create a fake cached file with the content hash
         let content = b"fake image";

@@ -209,7 +209,7 @@ impl Classifier {
             ChatCompletionTools::Function(ChatCompletionTool {
                 function: FunctionObject {
                     name: "describe_image".to_string(),
-                    description: Some("Describe an image or video by its URL. Downloads the media and returns a detailed text description. For images, describes objects, people, text, scenes, and style. For videos, extracts key frames and describes what's happening across the video — actions, settings, people, and visual content. ALWAYS call this for any image or video URL you see — you cannot determine what media contains from its URL alone. This includes profile picture URLs (e.g. Profile Image: https://...), image URLs (.jpg, .png, .gif, .webp), and video URLs (.mp4, .webm, .mov, .avi, .mkv).".to_string()),
+                    description: Some("Describe an image or video by its URL. Downloads the media and returns a detailed text description. For images, describes objects, people, text, scenes, and style. For videos, extracts key frames and transcribes spoken audio — the description combines both visual content and any spoken words. For pictures posted via kind 20 with imeta tags, you must call this for each image URL listed. ALWAYS call this for any image or video URL you see — you cannot determine what media contains from its URL alone. This includes profile picture URLs (e.g. Profile Image: https://...), image URLs (.jpg, .png, .gif, .webp), and video URLs (.mp4, .webm, .mov, .avi, .mkv).".to_string()),
                     parameters: Some(serde_json::json!({
                         "type": "object",
                         "properties": {
@@ -902,8 +902,25 @@ pub async fn describe_image(&self, path: &str, collector: &mut ChatLogCollector)
 
         // Detect if this is a video collage (files ending in .video.collage.jpg)
         let is_video_collage = path.contains(".video.collage.");
+
+        // For video collages, try to load the ASR transcript
+        let transcript = if is_video_collage {
+            let transcript_path = path.replace(".video.collage.jpg", ".video.transcript.txt");
+            tokio::fs::read_to_string(&transcript_path).await.ok()
+        } else {
+            None
+        };
+
         let prompt = if is_video_collage {
-            "This image is a collage of key frames extracted from a video. Describe what is happening in the video based on these frames. What actions, scenes, people, text, and settings are shown? How does the content progress across the frames? Be specific and objective. Keep description concise.".to_string()
+            let mut prompt = "This image is a collage of key frames extracted from a video. Describe what is happening in the video based on these frames. What actions, scenes, people, text, and settings are shown? How does the content progress across the frames? Be specific and objective. Keep description concise.".to_string();
+            if let Some(ref t) = transcript {
+                let trimmed = t.trim();
+                if !trimmed.is_empty() {
+                    prompt.push_str(&format!("\n\nVoice transcript from the video (AUDIO):\n{}", trimmed));
+                    prompt.push_str("\n\nIncorporate this transcript into your description — it reveals what is being said in the video. Combine visual and audio information into one cohesive description.");
+                }
+            }
+            prompt
         } else {
             "Describe this image in detail. What is shown? What colors, objects, people, text, or scenes are visible? Be specific and objective. Keep description concise.".to_string()
         };
