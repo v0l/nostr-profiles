@@ -1,4 +1,5 @@
 import { useState } from "preact/hooks";
+import { hexToBech32 } from "@snort/shared";
 import type { Stats } from "../types";
 import { LabelPill } from "./ProfileCard";
 import { timeAgo } from "../types";
@@ -93,8 +94,9 @@ interface RecentItemProps {
 }
 
 export function RecentItemCard({ item, onSearch }: RecentItemProps) {
+  const npub = hexToBech32("npub", item.pubkey) || item.pubkey;
   const displayName = item.display_name || item.name;
-  const name = displayName || item.pubkey.slice(0, 12) + "...";
+  const name = displayName || npub.slice(0, 12) + "...";
   return (
     <div class="card recent-item" onClick={(e) => { if (e.target === e.currentTarget) onSearch(item.pubkey); }}>
       <div class="recent-header">

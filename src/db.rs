@@ -59,6 +59,9 @@ pub struct Profile {
     pub display_name: Option<String>,
     pub about: Option<String>,
     pub picture: Option<String>,
+    pub lud16: Option<String>,
+    pub lud06: Option<String>,
+    pub website: Option<String>,
     pub is_classified: bool,
     pub follower_count: Option<i64>,
     pub metadata_json: Option<String>,
@@ -253,6 +256,28 @@ impl Database {
         }
 
         sqlx::migrate!().run(pool).await?;
+
+        // After migrations, rebuild FTS if it was dropped (schema changes).
+        let fts_count: i64 = sqlx::query_scalar(
+            r#"SELECT COUNT(*) FROM classifications_fts"#,
+        )
+        .fetch_one(pool)
+        .await?;
+        if fts_count == 0 {
+            sqlx::query(
+                r#"
+                INSERT INTO classifications_fts (rowid, name, display_name, about, nip05, lud16, lud06, website, labels, scores, bio, pubkey)
+                SELECT c.id, p.name, p.display_name, p.about, p.nip05, p.lud16, p.lud06, p.website,
+                       (SELECT group_concat(cl.label, ' ') FROM classification_labels cl WHERE cl.pubkey = c.pubkey),
+                       c.scores,
+                       c.bio, c.pubkey
+                FROM classifications c
+                JOIN profiles p ON p.pubkey = c.pubkey
+                "#,
+            )
+            .execute(pool)
+            .await?;
+        }
         Ok(())
     }
 
@@ -339,6 +364,9 @@ impl Database {
                         about = COALESCE(?, about),
                         picture = COALESCE(?, picture),
                         nip05 = COALESCE(?, nip05),
+                        lud16 = COALESCE(?, lud16),
+                        lud06 = COALESCE(?, lud06),
+                        website = COALESCE(?, website),
                         metadata_json = ?,
                         metadata_created_at = ?,
                         updated_at = CURRENT_TIMESTAMP
@@ -349,6 +377,9 @@ impl Database {
                 .bind(meta.about.as_deref())
                 .bind(meta.picture.as_deref())
                 .bind(meta.nip05.as_deref())
+                .bind(meta.lud16.as_deref())
+                .bind(meta.lud06.as_deref())
+                .bind(meta.website.as_deref())
                 .bind(&raw_json)
                 .bind(created_at)
                 .bind(&pubkey)
@@ -548,6 +579,9 @@ impl Database {
         let about = meta.about.as_deref();
         let picture = meta.picture.as_deref();
         let nip05 = meta.nip05.as_deref();
+        let lud16 = meta.lud16.as_deref();
+        let lud06 = meta.lud06.as_deref();
+        let website = meta.website.as_deref();
 
         // Only update if this metadata event is newer than what we have
         sqlx::query(
@@ -558,6 +592,9 @@ impl Database {
                 about = COALESCE(?, about),
                 picture = COALESCE(?, picture),
                 nip05 = COALESCE(?, nip05),
+                lud16 = COALESCE(?, lud16),
+                lud06 = COALESCE(?, lud06),
+                website = COALESCE(?, website),
                 metadata_json = ?,
                 metadata_created_at = ?,
                 updated_at = CURRENT_TIMESTAMP
@@ -569,6 +606,9 @@ impl Database {
         .bind(about)
         .bind(picture)
         .bind(nip05)
+        .bind(lud16)
+        .bind(lud06)
+        .bind(website)
         .bind(metadata_json)
         .bind(nostr_created_at)
         .bind(pubkey)
@@ -601,7 +641,7 @@ impl Database {
 
     pub async fn get_profile_details(&self, pubkey: &str) -> Result<Profile> {
         let profile = sqlx::query_as::<_, Profile>(
-            r#"SELECT pubkey, nip05, name, display_name, about, picture, is_classified, follower_count, metadata_json, created_at, updated_at FROM profiles WHERE pubkey = ?"#,
+            r#"SELECT pubkey, nip05, name, display_name, about, picture, lud16, lud06, website, is_classified, follower_count, metadata_json, metadata_created_at, created_at, updated_at FROM profiles WHERE pubkey = ?"#,
         )
         .bind(pubkey)
         .fetch_one(&self.pool)
@@ -670,7 +710,7 @@ impl Database {
 
     pub async fn get_profile_by_pubkey(&self, pubkey: &str) -> Result<Option<Profile>> {
         let profile = sqlx::query_as::<_, Profile>(
-            r#"SELECT pubkey, nip05, name, display_name, about, picture, is_classified, follower_count, metadata_json, metadata_created_at, created_at, updated_at FROM profiles WHERE pubkey = ?"#,
+            r#"SELECT pubkey, nip05, name, display_name, about, picture, lud16, lud06, website, is_classified, follower_count, metadata_json, metadata_created_at, created_at, updated_at FROM profiles WHERE pubkey = ?"#,
         )
         .bind(pubkey)
         .fetch_optional(&self.pool)
@@ -911,8 +951,8 @@ impl Database {
         // Derive labels from the indexed classification_labels table, joined as space-separated text for FTS
         sqlx::query(
             r#"
-            INSERT INTO classifications_fts (rowid, name, about, nip05, labels, scores, bio, pubkey)
-            SELECT c.id, p.name, p.about, p.nip05,
+            INSERT INTO classifications_fts (rowid, name, display_name, about, nip05, lud16, lud06, website, labels, scores, bio, pubkey)
+            SELECT c.id, p.name, p.display_name, p.about, p.nip05, p.lud16, p.lud06, p.website,
                    (SELECT group_concat(cl.label, ' ') FROM classification_labels cl WHERE cl.pubkey = c.pubkey),
                    c.scores,
                    c.bio, c.pubkey
@@ -940,8 +980,8 @@ impl Database {
         // Rebuild from classifications + profiles
         sqlx::query(
             r#"
-            INSERT INTO classifications_fts (rowid, name, about, nip05, labels, scores, bio, pubkey)
-            SELECT c.id, p.name, p.about, p.nip05,
+            INSERT INTO classifications_fts (rowid, name, display_name, about, nip05, lud16, lud06, website, labels, scores, bio, pubkey)
+            SELECT c.id, p.name, p.display_name, p.about, p.nip05, p.lud16, p.lud06, p.website,
                    (SELECT group_concat(cl.label, ' ') FROM classification_labels cl WHERE cl.pubkey = c.pubkey),
                    c.scores,
                    c.bio, c.pubkey
