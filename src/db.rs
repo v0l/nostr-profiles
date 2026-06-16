@@ -1,7 +1,10 @@
 use anyhow::Result;
 use nostr_sdk::JsonUtil;
 use serde::{Deserialize, Serialize};
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use sqlx::{FromRow, SqlitePool};
+use std::str::FromStr;
+use std::time::Duration;
 
 /// Kinds that are useful for classifying a profile.
 /// We only count and fetch these when determining if someone should be classified.
@@ -164,7 +167,24 @@ impl Database {
             fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
         }
         
-        let pool = SqlitePool::connect(path.to_str().unwrap()).await?;
+        // Configure SQLite for concurrent access. Without WAL + a busy timeout,
+        // the collector, classifier workers, and retention sweep collide on the
+        // single writer lock and fail immediately with SQLITE_BUSY
+        // ("database is locked"). WAL lets readers run concurrently with the
+        // writer, and busy_timeout makes writers wait for the lock instead of
+        // erroring.
+        let connect_opts = SqliteConnectOptions::from_str(path.to_str().unwrap())?
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal)
+            .synchronous(SqliteSynchronous::Normal)
+            .busy_timeout(Duration::from_secs(30))
+            .foreign_keys(true);
+
+        let pool = SqlitePoolOptions::new()
+            .max_connections(8)
+            .acquire_timeout(Duration::from_secs(30))
+            .connect_with(connect_opts)
+            .await?;
         Self::run_migrations(&pool).await?;
         Ok(Self { pool, label_min_score, label_counts_cache: std::sync::Mutex::new(None), stats_cache: std::sync::Mutex::new(None) })
     }
