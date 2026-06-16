@@ -113,11 +113,21 @@ pub struct KindCount {
     pub count: i64,
 }
 
+/// Cached full result of `get_stats`: (total_profiles, classified_profiles,
+/// total_unique_labels, label_counts, images_classified, total_events).
+type StatsTuple = (i64, i64, i64, Vec<(String, i64)>, i64, i64);
+
+/// How long a cached `get_stats` result stays fresh. The COUNT(*) queries over
+/// the events table are expensive on large databases (>10M rows), so we serve
+/// slightly stale counts rather than re-scanning on every request.
+const STATS_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
 #[derive(Debug)]
 pub struct Database {
     pub pool: SqlitePool,
     label_min_score: f64,
     label_counts_cache: std::sync::Mutex<Option<(Vec<(String, i64)>, f64, i64)>>,
+    stats_cache: std::sync::Mutex<Option<(StatsTuple, std::time::Instant)>>,
 }
 
 // Database is shared behind Arc, so Clone is manual (pool is Clone).
@@ -128,6 +138,7 @@ impl Clone for Database {
             pool: self.pool.clone(),
             label_min_score: self.label_min_score,
             label_counts_cache: std::sync::Mutex::new(None),
+            stats_cache: std::sync::Mutex::new(None),
         }
     }
 }
@@ -155,7 +166,7 @@ impl Database {
         
         let pool = SqlitePool::connect(path.to_str().unwrap()).await?;
         Self::run_migrations(&pool).await?;
-        Ok(Self { pool, label_min_score, label_counts_cache: std::sync::Mutex::new(None) })
+        Ok(Self { pool, label_min_score, label_counts_cache: std::sync::Mutex::new(None), stats_cache: std::sync::Mutex::new(None) })
     }
 
     /// Derive the label list from scores: keys where score >= min_score, sorted descending.
@@ -787,6 +798,8 @@ impl Database {
 
         // Invalidate label counts cache — a new classification changes the counts
         *self.label_counts_cache.lock().unwrap() = None;
+        // The cached stats snapshot is now stale too (counts changed).
+        *self.stats_cache.lock().unwrap() = None;
 
         Ok(())
     }
@@ -1072,9 +1085,22 @@ impl Database {
     /// Get all stats in a single query.
     /// Returns (total_profiles, classified_profiles, total_unique_labels, label_counts, images_classified, total_events).
     /// Labels are derived from scores keys where score >= label_min_score.
-    pub async fn get_stats(&self) -> Result<(i64, i64, i64, Vec<(String, i64)>, i64, i64)> {
+    pub async fn get_stats(&self) -> Result<StatsTuple> {
         let min_score = self.label_min_score;
         let epoch = crate::CLASSIFICATION_EPOCH as i64;
+
+        // Serve a recently-cached full result if still fresh. The COUNT(*)
+        // queries below scan the entire events table (>10M rows), which is far
+        // too expensive to run on every /api/stats request.
+        {
+            let cache = self.stats_cache.lock().unwrap();
+            if let Some((ref cached, at)) = *cache {
+                if at.elapsed() < STATS_CACHE_TTL {
+                    return Ok(cached.clone());
+                }
+            }
+        }
+
         let (total_profiles, classified_profiles, images_classified, total_events): (i64, i64, i64, i64) =
             sqlx::query_as(
                 r#"SELECT
@@ -1094,7 +1120,9 @@ impl Database {
             let cache = self.label_counts_cache.lock().unwrap();
             if let Some((ref cached_counts, cached_min_score, cached_epoch)) = *cache {
                 if (cached_min_score - min_score).abs() < f64::EPSILON && cached_epoch == epoch {
-                    return Ok((total_profiles, classified_profiles, cached_counts.len() as i64, cached_counts.clone(), images_classified, total_events));
+                    let result = (total_profiles, classified_profiles, cached_counts.len() as i64, cached_counts.clone(), images_classified, total_events);
+                    *self.stats_cache.lock().unwrap() = Some((result.clone(), std::time::Instant::now()));
+                    return Ok(result);
                 }
             }
         }
@@ -1117,7 +1145,9 @@ impl Database {
         // Cache the result
         *self.label_counts_cache.lock().unwrap() = Some((label_counts.clone(), min_score, epoch));
 
-        Ok((total_profiles, classified_profiles, total_unique_labels, label_counts, images_classified, total_events))
+        let result = (total_profiles, classified_profiles, total_unique_labels, label_counts, images_classified, total_events);
+        *self.stats_cache.lock().unwrap() = Some((result.clone(), std::time::Instant::now()));
+        Ok(result)
     }
 
     /// Prepare a user query for FTS5: add prefix wildcard to each term.
