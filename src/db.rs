@@ -887,6 +887,53 @@ impl Database {
         Ok(())
     }
 
+    /// Retain only the newest `max_per_pubkey` events per pubkey, deleting the rest.
+    ///
+    /// This bounds the events table by count rather than by age: heavy posters
+    /// (and firehose noise) get capped, while infrequent posters keep all of
+    /// their events so they can still accumulate enough to be classified.
+    ///
+    /// Returns the total number of events deleted.
+    pub async fn retain_events_per_pubkey(&self, max_per_pubkey: i64) -> Result<u64> {
+        // Find pubkeys exceeding the cap first (cheap via the covering index on
+        // (pubkey, kind, created_at)), then trim each one. Doing it per-pubkey
+        // keeps each DELETE small and avoids a giant window-function scan over
+        // the whole table.
+        let over_cap: Vec<(String,)> = sqlx::query_as(
+            r#"SELECT pubkey FROM events GROUP BY pubkey HAVING COUNT(*) > ?"#,
+        )
+        .bind(max_per_pubkey)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut total_deleted: u64 = 0;
+        for (pubkey,) in over_cap {
+            let result = sqlx::query(
+                r#"DELETE FROM events
+                   WHERE pubkey = ?
+                     AND id IN (
+                         SELECT id FROM events
+                         WHERE pubkey = ?
+                         ORDER BY created_at DESC
+                         LIMIT -1 OFFSET ?
+                     )"#,
+            )
+            .bind(&pubkey)
+            .bind(&pubkey)
+            .bind(max_per_pubkey)
+            .execute(&self.pool)
+            .await?;
+            total_deleted += result.rows_affected();
+        }
+
+        // Invalidate cached stats since the event total changed.
+        if total_deleted > 0 {
+            *self.stats_cache.lock().unwrap() = None;
+        }
+
+        Ok(total_deleted)
+    }
+
     pub async fn delete_old_events_for_pubkey(&self, pubkey: &str, max_age_days: u64) -> Result<u64> {
         let cutoff = chrono::Utc::now() - chrono::Duration::days(max_age_days as i64);
         let cutoff_ts = cutoff.timestamp();

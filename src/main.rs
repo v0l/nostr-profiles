@@ -122,6 +122,27 @@ async fn main() -> Result<()> {
         }
     }
 
+    // Periodic per-pubkey event retention sweep: caps the events table by
+    // count-per-pubkey so it can't grow unbounded, while keeping all events for
+    // infrequent posters so they can still reach the classification threshold.
+    let retention_db = Arc::clone(&db);
+    let max_per_pubkey = config.processing.max_events_per_pubkey as i64;
+    let retention_interval = config.processing.event_retention_interval_secs;
+    let _retention_handle = tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(retention_interval.max(1)));
+        loop {
+            tick.tick().await;
+            match retention_db.retain_events_per_pubkey(max_per_pubkey).await {
+                Ok(0) => {}
+                Ok(deleted) => tracing::info!(
+                    "Event retention sweep: deleted {} events over the per-pubkey cap of {}",
+                    deleted, max_per_pubkey
+                ),
+                Err(e) => tracing::error!("Event retention sweep failed: {}", e),
+            }
+        }
+    });
+
     let collector = crate::nostr_collector::NostrCollector;
     let collector_handle = tokio::spawn(async move {
         if let Err(e) = collector.run(db, nostr, Arc::clone(&job_queue), &config).await {

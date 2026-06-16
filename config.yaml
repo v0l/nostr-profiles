@@ -21,6 +21,12 @@ processing:
   event_threshold: 20
   classification_event_limit: 50
   cache_days: 7
+  # Cap on newest events retained per pubkey. A periodic sweep trims the excess,
+  # bounding the events table while keeping all events for infrequent posters so
+  # they can still accumulate enough to be classified. Keep >= classification_event_limit.
+  max_events_per_pubkey: 64
+  # How often (seconds) to run the per-pubkey retention sweep.
+  event_retention_interval_secs: 3600
   max_workers: 4
   max_retries: 3
   image_download_timeout_secs: 30

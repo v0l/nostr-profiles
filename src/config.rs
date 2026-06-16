@@ -30,12 +30,29 @@ pub struct NostrConfig {
     pub nsec: Option<String>,
 }
 
+fn default_max_events_per_pubkey() -> usize {
+    64
+}
+
+fn default_event_retention_interval_secs() -> u64 {
+    3600
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProcessingConfig {
     pub event_threshold: usize,
     /// Max number of recent events to feed into the classifier (default: 50)
     pub classification_event_limit: usize,
     pub cache_days: u64,
+    /// Maximum number of (newest) events retained per pubkey. A periodic sweep
+    /// deletes anything beyond this cap, bounding the events table while still
+    /// keeping every event for infrequent posters (who stay under the cap) so
+    /// they can eventually accumulate enough to be classified (default: 64).
+    #[serde(default = "default_max_events_per_pubkey")]
+    pub max_events_per_pubkey: usize,
+    /// How often (seconds) to run the per-pubkey event retention sweep (default: 3600).
+    #[serde(default = "default_event_retention_interval_secs")]
+    pub event_retention_interval_secs: u64,
     pub max_workers: usize,
     pub max_retries: u8,
     pub image_download_timeout_secs: u64,
